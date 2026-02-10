@@ -1,781 +1,670 @@
-import httpx
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
+# Restricted-use credential — permitted only under UAPL v1.0 and associated service provider terms
+import asyncio
+import base64
+import contextlib
+import json
+import os
 import re
+import ssl
+from pathlib import Path
+from typing import Any, Optional, Union, cast
+from urllib.error import URLError
+
+from tvdb_v4_official import TVDB
+
 from src.console import console
-from data.config import config
-
-config = config
 
 
-async def get_tvdb_episode_data(base_dir, token, tvdb_id, season, episode, api_key=None, retry_attempted=False, debug=False):
-    if debug:
-        console.print(f"[cyan]Fetching TVDb episode data for S{season}E{episode}...[/cyan]")
+def _get_tvdb_k() -> str:
+    k = (
+        b"MDEwMTEwMDEwMDExMDAxMDAxMDExMDAxMDExMTEwMDAwMTAwMTExMDAxMTAxMTAxMDEwMTAwMDEwMDExMDEwMD"
+        b"AxMDAxMTAxMDExMDEwMTAwMTAxMDAwMTAxMTEwMTAwMDEwMTEwMDEwMDExMDAxMDAxMDAxMDAxMDAxMTAwMTEw"
+        b"MTAwMTEwMTAxMDEwMDExMDAxMTAwMDAwMDExMDAwMDAxMDAxMTEwMDExMDEwMTAwMTEwMTAwMDAxMTAxMTAwMD"
+        b"EwMDExMDAwMTAxMDExMTAxMDAwMTAxMDAxMTAwMTAwMTAxMTAwMTAxMDEwMTAwMDEwMDAxMDEwMTExMDEwMDAx"
+        b"MDAxMTEwMDExMTEwMTAwMTAwMDAxMDAxMTAxMDEwMDEwMTEwMTAwMTAwMDExMTAxMDEwMDAxMDExMTEwMDAwMT"
+        b"AxMTAwMTAxMDEwMTExMDEwMTAwMTAwMTEwMTAxMDAxMDAxMTEwMDEwMTAxMTEwMTAxMTAxMDAxMTAxMDEw"
+    )
+    binary_bytes = base64.b64decode(k)
+    b64_bytes = bytes(
+        int(binary_bytes[i: i + 8], 2) for i in range(0, len(binary_bytes), 8)
+    )
+    return base64.b64decode(b64_bytes).decode()
 
-    url = f"https://api4.thetvdb.com/v4/series/{tvdb_id}/episodes/default"
-    params = {
-        "page": 1,
-        "season": season,
-        "episodeNumber": episode
-    }
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
 
+tvdb: Union[TVDB, None] = None
+_tvdb_init_error: Optional[Exception] = None
+_tvdb_error_reported = False
+
+
+def _coerce_int(value: Any) -> Optional[int]:
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, params=params, headers=headers, timeout=30.0)
-
-            # Handle unauthorized responses
-            if response.status_code == 401:
-                # Only attempt a retry once to prevent infinite loops
-                if api_key and not retry_attempted:
-                    console.print("[yellow]Unauthorized access. Refreshing TVDb token...[/yellow]")
-                    new_token = await get_tvdb_token(api_key, base_dir)
-                    if new_token:
-                        # Retry the request with the new token
-                        return await get_tvdb_episode_data(
-                            base_dir, new_token, tvdb_id, season, episode, api_key, True
-                        )
-                    else:
-                        console.print("[red]Failed to refresh TVDb token[/red]")
-                        return None
-                else:
-                    console.print("[red]Unauthorized access to TVDb API[/red]")
-                    return None
-
-            response.raise_for_status()
-            data = response.json()
-
-            # Check for "Unauthorized" message in response body
-            if data.get("message") == "Unauthorized":
-                if api_key and not retry_attempted:
-                    console.print("[yellow]Token invalid or expired. Refreshing TVDb token...[/yellow]")
-                    new_token = await get_tvdb_token(api_key, base_dir)
-                    if new_token:
-                        return await get_tvdb_episode_data(
-                            base_dir, new_token, tvdb_id, season, episode, api_key, True
-                        )
-                    else:
-                        console.print("[red]Failed to refresh TVDb token[/red]")
-                        return None
-                else:
-                    console.print("[red]Unauthorized response from TVDb API[/red]")
-                    return None
-
-            if data.get("status") == "success" and data.get("data") and data["data"].get("episodes"):
-                episode_data = data["data"]["episodes"][0]
-                series_data = data["data"].get("series", {})
-
-                result = {
-                    "episode_name": episode_data.get("name", ""),
-                    "overview": episode_data.get("overview", ""),
-                    "season_number": episode_data.get("seasonNumber", season),
-                    "episode_number": episode_data.get("number", episode),
-                    "air_date": episode_data.get("aired", ""),
-                    "season_name": episode_data.get("seasonName", ""),
-                    "series_name": series_data.get("name", ""),
-                    "series_overview": series_data.get("overview", ""),
-                    'series_year': series_data.get("year", ""),
-                }
-
-                if debug:
-                    console.print(f"[green]Found episode: {result['season_name']} - S{result['season_number']}E{result['episode_number']} - {result['episode_name']}[/green] - {result['air_date']}")
-                    console.print(f"[yellow]Overview: {result['overview']}")
-                    console.print(f"[yellow]Series: {result['series_name']} - {result['series_overview']}[/yellow]")
-                return result
-            else:
-                if debug:
-                    console.print(f"[yellow]No TVDB episode data found for S{season}E{episode}[/yellow]")
-                return None
-
-    except httpx.HTTPStatusError as e:
-        console.print(f"[red]HTTP error occurred: {e.response.status_code} - {e.response.text}[/red]")
-        return None
-    except httpx.RequestError as e:
-        console.print(f"[red]Request error occurred: {e}[/red]")
-        return None
-    except Exception as e:
-        console.print(f"[red]Error fetching TVDb episode data: {e}[/red]")
+        return int(value)
+    except (TypeError, ValueError):
         return None
 
 
-async def get_tvdb_token(api_key, base_dir):
-    console.print("[cyan]Authenticating with TVDb API...[/cyan]")
+def _as_dict_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [cast(dict[str, Any], item) for item in cast(list[Any], value) if isinstance(item, dict)]
+    return []
 
-    url = "https://api4.thetvdb.com/v4/login"
-    headers = {
-        "accept": "application/json",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "apikey": api_key,
-        "pin": "string"  # Default value as specified in the example
-    }
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, headers=headers, timeout=30.0)
-            response.raise_for_status()
-            data = response.json()
+try:
+    tvdb = TVDB(_get_tvdb_k())
+except (ssl.SSLError, URLError) as e:
+    _tvdb_init_error = e
+except Exception as e:
+    _tvdb_init_error = e
 
-            if data.get("status") == "success" and data.get("data") and data["data"].get("token"):
-                token = data["data"]["token"]
-                console.print("[green]Successfully authenticated with TVDb[/green]")
-                console.print(f"[bold yellow]New TVDb token: {token[:10]}...[/bold yellow]")
 
-                # Update the token in the in-memory configuration
-                config['DEFAULT']['tvdb_token'] = f'"{token}"'
+def _get_tvdb_or_warn() -> Optional[TVDB]:
+    global _tvdb_error_reported
 
-                # Save the updated config to disk
-                try:
-                    # Get the config file path
-                    config_path = f"{base_dir}/data/config.py"
+    if tvdb is not None:
+        return tvdb
 
-                    # Read the current config file
-                    with open(config_path, 'r', encoding='utf-8') as file:
-                        config_data = file.read()
+    if not _tvdb_error_reported:
+        _tvdb_error_reported = True
+        if _tvdb_init_error:
+            console.print(
+                "[yellow]TVDB login failed; continuing without TVDB. "
+                f"Reason: {_tvdb_init_error}[/yellow]"
+            )
+            console.print(
+                "[yellow]This is usually a local Python CA/cert issue. "
+                "Fix options: install/update Windows roots, or set SSL_CERT_FILE to certifi's bundle "
+                "(e.g. `python -c \"import certifi; print(certifi.where())\"`).[/yellow]"
+            )
+        else:
+            console.print("[yellow]TVDB unavailable; continuing without TVDB.[/yellow]")
 
-                    token_pattern = '"tvdb_token":'
-                    if token_pattern in config_data:
-                        # Find the line with tvdb_token
-                        lines = config_data.splitlines()
-                        for i, line in enumerate(lines):
-                            if token_pattern in line:
-                                # Split the line at the colon and keep everything before it
-                                prefix = line.split(':', 1)[0]
-                                # Create a new line with the updated token
-                                lines[i] = f'{prefix}: "{token}",'
+    return None
+
+
+class tvdb_data:
+    def __init__(self, config: Any) -> None:
+        self.config = config
+        pass
+
+    async def search_tvdb_series(
+        self,
+        filename: str,
+        year: Optional[str] = None,
+        debug: bool = False,
+    ) -> tuple[Optional[list[dict[str, Any]]], Optional[int]]:
+        if debug:
+            console.print(f"filename for TVDB search: {filename} year: {year}")
+        client = _get_tvdb_or_warn()
+        if client is None:
+            return None, None
+
+        results = _as_dict_list(cast(Any, client).search({filename}, year=year, type="series", lang="eng"))
+        await asyncio.sleep(0.1)
+        try:
+            if results and len(results) > 0:
+                # Try to find the best match based on year
+                best_match: Optional[dict[str, Any]] = None
+                search_year = str(year) if year else ''
+
+                if search_year:
+                    # First, try to find exact year match
+                    for result in results:
+                        if result.get('year') == search_year:
+                            best_match = result
+                            break
+
+                # If no exact match, check aliases for year-based names
+                if not best_match and search_year:
+                    for result in results:
+                        aliases_raw = result.get('aliases', [])
+                        aliases = cast(list[Any], aliases_raw) if isinstance(aliases_raw, list) else []
+                        if aliases:
+                            # Check if any alias contains the year in parentheses
+                            for alias in aliases:
+                                alias_name = str(cast(dict[str, Any], alias).get('name', '')) if isinstance(alias, dict) else str(alias)
+                                if f"({search_year})" in alias_name:
+                                    best_match = result
+                                    break
+                            if best_match:
                                 break
 
-                        # Rejoin the lines and write back to the file
-                        new_config_data = '\n'.join(lines)
-                        with open(config_path, 'w', encoding='utf-8') as file:
-                            file.write(new_config_data)
+                # If still no match, use first result
+                if not best_match:
+                    best_match = results[0]
 
-                        console.print(f"[bold green]TVDb token successfully saved to {config_path}[/bold green]")
-                    else:
-                        console.print("[yellow]Warning: Could not find tvdb_token in configuration file[/yellow]")
-                        console.print("[yellow]The token will be used for this session only.[/yellow]")
-
-                except Exception as e:
-                    console.print(f"[yellow]Warning: Could not update TVDb token in configuration file: {e}[/yellow]")
-                    console.print("[yellow]The token will be used for this session only.[/yellow]")
-
-                return token
+                series_id = best_match['tvdb_id'] if best_match else None
+                if debug:
+                    console.print(f"[blue]TVDB series ID: {series_id}[/blue]")
+                return results, _coerce_int(series_id)
             else:
-                console.print("[red]Failed to get TVDb token: Invalid response format[/red]")
-                return None
+                console.print("[yellow]No TVDB results found[/yellow]")
+                return None, None
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+            return None, None
 
-    except httpx.HTTPStatusError as e:
-        console.print(f"[red]HTTP error occurred during TVDb authentication: {e.response.status_code} - {e.response.text}[/red]")
-        return None
-    except httpx.RequestError as e:
-        console.print(f"[red]Request error occurred during TVDb authentication: {e}[/red]")
-        return None
-    except Exception as e:
-        console.print(f"[red]Error authenticating with TVDb: {e}[/red]")
-        return None
+    async def get_tvdb_episodes(
+        self,
+        series_id: Union[int, str],
+        base_dir: Optional[Union[str, bool]] = None,
+        debug: bool = False,
+        season: Optional[Union[int, str]] = None,
+        episode: Optional[Union[int, str]] = None,
+        absolute_number: Optional[Union[int, str]] = None,
+        aired_date: Optional[str] = None,
+    ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        # Backward compat: older call sites used (series_id, debug)
+        if isinstance(base_dir, bool) and debug is False:
+            debug = base_dir
+            base_dir = None
 
+        def _episode_is_present(episodes: list[dict[str, Any]]) -> bool:
+            if not episodes:
+                return False
 
-async def get_tvdb_series_episodes(base_dir, token, tvdb_id, season, episode, api_key=None, retry_attempted=False, debug=False):
-    if debug:
-        console.print(f"[cyan]Fetching episode list for series ID {tvdb_id}...[/cyan]")
+            # If no specific episode requested, any cached payload is acceptable.
+            if season is None and episode is None and absolute_number is None and not aired_date:
+                return True
 
-    url = f"https://api4.thetvdb.com/v4/series/{tvdb_id}/extended?meta=episodes&short=false"
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
+            aired_norm = None
+            if aired_date:
+                aired_norm = str(aired_date).strip().replace('.', '-')
 
-    all_episodes = []
+            # Normalize numeric inputs
+            try:
+                season_int = int(season) if season is not None else None
+            except (TypeError, ValueError):
+                season_int = None
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, timeout=30.0)
+            try:
+                episode_int = int(episode) if episode is not None else None
+            except (TypeError, ValueError):
+                episode_int = None
 
-            # Handle unauthorized responses
-            if response.status_code == 401:
-                # Only attempt a retry once to prevent infinite loops
-                if api_key and not retry_attempted:
-                    console.print("[yellow]Unauthorized access. Refreshing TVDb token...[/yellow]")
-                    new_token = await get_tvdb_token(api_key, base_dir)
-                    if new_token:
-                        # Retry the request with the new token
-                        return await get_tvdb_series_episodes(
-                            base_dir, new_token, tvdb_id, season, episode, api_key, True
-                        )
-                    else:
-                        console.print("[red]Failed to refresh TVDb token[/red]")
-                        return (season, episode)
-                else:
-                    console.print("[red]Unauthorized access to TVDb API[/red]")
-                    return (season, episode)
+            try:
+                absolute_int = int(absolute_number) if absolute_number is not None else None
+            except (TypeError, ValueError):
+                absolute_int = None
 
-            response.raise_for_status()
-            data = response.json()
+            # For daily-style episodes, match by aired date.
+            if aired_norm:
+                for ep in episodes:
+                    if ep.get('aired') == aired_norm:
+                        return True
 
-            # Check for "Unauthorized" message in response body
-            if data.get("message") == "Unauthorized":
-                if api_key and not retry_attempted:
-                    console.print("[yellow]Token invalid or expired. Refreshing TVDb token...[/yellow]")
-                    new_token = await get_tvdb_token(api_key, base_dir)
-                    if new_token:
-                        return await get_tvdb_series_episodes(
-                            base_dir, new_token, tvdb_id, season, episode, api_key, True
-                        )
-                    else:
-                        console.print("[red]Failed to refresh TVDb token[/red]")
-                        return (season, episode)
-                else:
-                    console.print("[red]Unauthorized response from TVDb API[/red]")
-                    return (season, episode)
+            # Treat episode==0/None as "no specific episode" (season packs, etc.)
+            if episode_int in (None, 0) and absolute_int is None and not aired_norm:
+                return True
 
-            if data.get("status") == "success" and data.get("data"):
-                episodes = data["data"].get("episodes", [])
-                all_episodes = episodes
+            for ep in episodes:
+                if absolute_int is not None and ep.get('absoluteNumber') == absolute_int:
+                    return True
 
-            if not all_episodes:
-                if debug:
-                    console.print(f"[yellow]No episodes found for TVDB series ID {tvdb_id}[/yellow]")
-                return (season, episode)
+                if season_int is not None and episode_int not in (None, 0) and ep.get('seasonNumber') == season_int and ep.get('number') == episode_int:
+                    return True
 
-            if debug:
-                console.print(f"[cyan]Looking for season {season} episode {episode} in series {tvdb_id}[/cyan]")
-
-            # Process and organize episode data
-            episodes_by_season = {}
-            absolute_mapping = {}  # Map absolute numbers to season/episode
-
-            # Sort by aired date first (if available)
-            def get_aired_date(ep):
-                aired = ep.get("aired")
-                # Return default value if aired is None or not present
-                if aired is None:
-                    return "9999-99-99"
-                return aired
-
-            all_episodes.sort(key=get_aired_date)
-
-            for ep in all_episodes:
-                season_number = ep.get("seasonNumber")
-                episode_number = ep.get("number")
-                absolute_episode_count = ep.get("absoluteNumber")
-
-                # Ensure season_number is valid and convert to int if needed
-                if season_number is not None:
-                    try:
-                        season_number = int(season_number)
-                    except (ValueError, TypeError):
-                        console.print(f"[yellow]Invalid season number: {season_number}, skipping episode[/yellow]")
-                        continue
-                else:
-                    console.print(f"[yellow]Missing season number for episode {ep.get('name', 'Unknown')}, skipping[/yellow]")
-                    continue
-
-                # Ensure episode_number is valid
-                if episode_number is not None:
-                    try:
-                        episode_number = int(episode_number)
-                    except (ValueError, TypeError):
-                        console.print(f"[yellow]Invalid episode number: {episode_number}, skipping episode[/yellow]")
-                        continue
-
-                # Handle special seasons (e.g., season 0)
-                is_special = season_number == 0
-
-                if not is_special:
-                    # Store mapping of absolute number to season/episode
-                    absolute_mapping[absolute_episode_count] = {
-                        "season": season_number,
-                        "episode": episode_number,
-                        "episode_data": ep
-                    }
-
-                episode_data = {
-                    "id": ep.get("id"),
-                    "name": ep.get("name", ""),
-                    "overview": ep.get("overview", ""),
-                    "seasonNumber": season_number,
-                    "episodeNumber": episode_number,
-                    "absoluteNumber": absolute_episode_count if not is_special else None,
-                    "aired": ep.get("aired"),
-                    "runtime": ep.get("runtime"),
-                    "imageUrl": ep.get("image"),
-                    "thumbUrl": ep.get("thumbnail"),
-                    "isMovie": ep.get("isMovie", False),
-                    "airsAfterSeason": ep.get("airsAfterSeason"),
-                    "airsBeforeSeason": ep.get("airsBeforeSeason"),
-                    "airsBeforeEpisode": ep.get("airsBeforeEpisode"),
-                    "productionCode": ep.get("productionCode", ""),
-                    "finaleType": ep.get("finaleType", ""),
-                    "year": ep.get("year")
-                }
-
-                # Create a season entry if it doesn't exist
-                if season_number not in episodes_by_season:
-                    episodes_by_season[season_number] = []
-
-                # Add the episode to its season
-                episodes_by_season[season_number].append(episode_data)
-
-            # Sort episodes within each season by episode number
-            for s in episodes_by_season:
-                valid_episodes = [ep for ep in episodes_by_season[s] if ep["episodeNumber"] is not None]
-                episodes_by_season[s] = sorted(valid_episodes, key=lambda ep: ep["episodeNumber"])
-
-            # If season and episode were provided, try to find the matching episode
-            if season is not None and episode is not None:
-                found_episode = None
-
-                # Ensure season is an integer
-                try:
-                    season = int(season)
-                except (ValueError, TypeError):
-                    if debug:
-                        console.print(f"[yellow]Invalid season number provided: {season}, using as-is[/yellow]")
-
-                if debug:
-                    console.print(f"[cyan]Looking for season {season} (type: {type(season)}) in episodes_by_season keys: {sorted(episodes_by_season.keys())} (types: {[type(s) for s in episodes_by_season.keys()]})[/cyan]")
-
-                # First try to find the episode in the specified season
-                if season in episodes_by_season:
-                    if debug:
-                        console.print(f"[green]Found season {season} in episodes_by_season[/green]")
-
-                    # Convert episode to int if not already
-                    try:
-                        episode = int(episode)
-                    except (ValueError, TypeError):
-                        if debug:
-                            console.print(f"[yellow]Invalid episode number provided: {episode}, using as-is[/yellow]")
-
-                    max_episode_in_season = max([ep["episodeNumber"] or 0 for ep in episodes_by_season[season]])
-
-                    if episode <= max_episode_in_season:
-                        # Episode exists in this season normally
-                        for ep in episodes_by_season[season]:
-                            if ep["episodeNumber"] == episode:
-                                found_episode = ep
-                                if debug:
-                                    console.print(f"[green]Found episode S{season}E{episode} directly: {ep['name']}[/green]")
-                                # Since we found it directly, return the original season and episode
-                                return (season, episode, ep['id'])
-                    else:
-                        # Episode number is greater than max in this season, so try absolute numbering
-                        if debug:
-                            console.print(f"[yellow]Episode {episode} is greater than max episode ({max_episode_in_season}) in season {season}[/yellow]")
-                            console.print("[yellow]Trying to find by absolute episode number...[/yellow]")
-
-                        # Calculate absolute episode number
-                        absolute_number = episode
-                        for s in range(1, season):
-                            if s in episodes_by_season:
-                                absolute_number += len(episodes_by_season[s])
-
-                        if absolute_number in absolute_mapping:
-                            actual_season = absolute_mapping[absolute_number]["season"]
-                            actual_episode = absolute_mapping[absolute_number]["episode"]
-
-                            # Find the episode in the seasons data
-                            for ep in episodes_by_season[actual_season]:
-                                if ep["episodeNumber"] == actual_episode:
-                                    found_episode = ep
-                                    if debug:
-                                        console.print(f"[green]Found by absolute number {absolute_number}: S{actual_season}E{actual_episode} - {ep['name']}[/green]")
-                                        console.print(f"[bold yellow]Note: S{season}E{episode} maps to S{actual_season}E{actual_episode} using absolute numbering[/bold yellow]")
-                                    # Return the absolute-based season and episode since that's what corresponds to the actual content
-                                    return (actual_season, actual_episode, ep['id'])
-                        else:
-                            if debug:
-                                console.print(f"[red]Could not find episode with absolute number {absolute_number}[/red]")
-                            # Return original values if absolute mapping failed
-                            return (season, episode, None)
-                else:
-                    if debug:
-                        console.print(f"[red]Season {season} not found in series[/red]")
-                    # Return original values if season wasn't found
-                    return (season, episode, None)
-
-                # If we get here and haven't returned yet, return the original values
-                if not found_episode:
-                    if debug:
-                        console.print(f"[yellow]No matching episode found, keeping original S{season}E{episode}[/yellow]")
-                    return (season, episode, None)
-
-            # If we get here, no specific episode was requested or processing, so return the original values
-            return (season, episode, None)
-
-    except httpx.HTTPStatusError as e:
-        console.print(f"[red]HTTP error occurred: {e.response.status_code} - {e.response.text}[/red]")
-        return (season, episode, None)
-    except httpx.RequestError as e:
-        console.print(f"[red]Request error occurred: {e}[/red]")
-        return (season, episode, None)
-    except Exception as e:
-        console.print(f"[red]Error fetching TVDb episode list: {str(e)}[/red]")
-        import traceback
-        console.print(f"[dim]{traceback.format_exc()}[/dim]")
-        return (season, episode, None)
-
-
-async def get_tvdb_series_data(base_dir, token, tvdb_id, api_key=None, retry_attempted=False, debug=False):
-    if debug:
-        console.print(f"[cyan]Fetching TVDb series data for ID {tvdb_id}...[/cyan]")
-    url = f"https://api4.thetvdb.com/v4/series/{tvdb_id}"
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, timeout=30.0)
-
-            if response.status_code == 401:
-                if api_key and not retry_attempted:
-                    console.print("[yellow]Unauthorized access. Refreshing TVDb token...[/yellow]")
-                    new_token = await get_tvdb_token(api_key, base_dir)
-                    if new_token:
-                        return await get_tvdb_series_data(
-                            base_dir, new_token, tvdb_id, api_key, True, debug
-                        )
-                    else:
-                        console.print("[red]Failed to refresh TVDb token[/red]")
-                        return None
-                else:
-                    console.print("[red]Unauthorized access to TVDb API[/red]")
-                    return None
-
-            response.raise_for_status()
-            data = response.json()
-
-            if data.get("message") == "Unauthorized":
-                if api_key and not retry_attempted:
-                    console.print("[yellow]Token invalid or expired. Refreshing TVDb token...[/yellow]")
-                    new_token = await get_tvdb_token(api_key, base_dir)
-                    if new_token:
-                        return await get_tvdb_series_data(
-                            base_dir, new_token, tvdb_id, api_key, True, debug
-                        )
-                    else:
-                        console.print("[red]Failed to refresh TVDb token[/red]")
-                        return None
-                else:
-                    console.print("[red]Unauthorized response from TVDb API[/red]")
-                    return None
-
-            if data.get("status") == "success" and data.get("data"):
-                series_data = data["data"]
-                series_name = series_data.get("name")
-                if debug:
-                    console.print(f"[bold cyan]TVDB series name: {series_name}[/bold cyan]")
-                return series_name
-            else:
-                if debug:
-                    console.print(f"[yellow]No TVDb series data found for {tvdb_id}[/yellow]")
-                return None
-
-    except httpx.HTTPStatusError as e:
-        console.print(f"[red]HTTP error occurred: {e.response.status_code} - {e.response.text}[/red]")
-        return None
-    except httpx.RequestError as e:
-        console.print(f"[red]Request error occurred: {e}[/red]")
-        return None
-    except Exception as e:
-        console.print(f"[red]Error fetching TVDb series data: {e}[/red]")
-        return None
-
-
-async def get_tvdb_series(base_dir, title, year, apikey=None, token=None, debug=False):
-    if debug:
-        console.print(f"[cyan]Searching for TVDb series: {title} ({year})...[/cyan]")
-
-    # Validate inputs
-    if not apikey:
-        console.print("[red]No TVDb API key provided[/red]")
-        return 0
-
-    if not token:
-        console.print("[red]No TVDb token provided[/red]")
-        return 0
-
-    if not title:
-        console.print("[red]No title provided for TVDb search[/red]")
-        return 0
-
-    async def search_tvdb(search_title, search_year=None, attempt_description=""):
-        """Helper function to perform the actual search"""
-        url = "https://api4.thetvdb.com/v4/search"
-        headers = {
-            "accept": "application/json",
-            "Authorization": f"Bearer {token}"
-        }
-        params = {
-            "query": search_title
-        }
-
-        if search_year:
-            params["year"] = search_year
-
-        if debug:
-            console.print(f"[cyan]{attempt_description}Searching with query: '{search_title}'{f' (year: {search_year})' if search_year else ''}[/cyan]")
-
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, params=params, headers=headers, timeout=30.0)
-
-            if response.status_code == 401:
-                console.print("[yellow]Unauthorized access. Token may be expired. Refreshing TVDb token...[/yellow]")
-                new_token = await get_tvdb_token(apikey, base_dir)
-                if new_token:
-                    headers["Authorization"] = f"Bearer {new_token}"
-                    response = await client.get(url, params=params, headers=headers, timeout=30.0)
-                    response.raise_for_status()
-                else:
-                    console.print("[red]Failed to refresh TVDb token[/red]")
-                    return None
-            else:
-                response.raise_for_status()
-
-            data = response.json()
-
-            if data.get("message") == "Unauthorized":
-                console.print("[yellow]Token invalid or expired. Refreshing TVDb token...[/yellow]")
-                new_token = await get_tvdb_token(apikey, base_dir)
-                if new_token:
-                    headers["Authorization"] = f"Bearer {new_token}"
-                    response = await client.get(url, params=params, headers=headers, timeout=30.0)
-                    response.raise_for_status()
-                    data = response.json()
-                else:
-                    console.print("[red]Failed to refresh TVDb token[/red]")
-                    return None
-
-            return data
-
-    def names_match(series_name, search_title):
-        """Check if series name matches the search title (case-insensitive, basic cleanup)"""
-        if not series_name or not search_title:
             return False
 
-        series_clean = series_name.lower().strip()
-        title_clean = search_title.lower().strip()
-        if series_clean == title_clean:
-            return True
-
-        series_cleaned = re.sub(r'[^\w\s]', '', series_clean)
-        title_cleaned = re.sub(r'[^\w\s]', '', title_clean)
-
-        return series_cleaned == title_cleaned
-
-    try:
-        # First attempt: Search with title and year (if year provided)
-        data = await search_tvdb(title, year, "Initial attempt: ")
-
-        if data and data.get("status") == "success" and data.get("data"):
-            all_results = data["data"]
-            series_list = [item for item in all_results if item.get("type") == "series"]
-
+        series_id_int = _coerce_int(series_id)
+        if series_id_int is None:
             if debug:
-                console.print(f"[green]Found {len(all_results)} total results, {len(series_list)} series matches[/green]")
-                if series_list:
-                    for i, series in enumerate(series_list[:3]):
-                        name = series.get("name", "Unknown")
-                        year_found = series.get("year", "Unknown")
-                        tvdb_id = series.get("tvdb_id", "Unknown")
-                        console.print(f"[cyan]  {i+1}. {name} ({year_found}) - ID: {tvdb_id}[/cyan]")
+                console.print(f"[yellow]Invalid TVDB series ID: {series_id}[/yellow]")
+            return None, None
 
-            # Check if we found series and if the first result matches our title
-            if series_list:
-                first_series = series_list[0]
-                series_name = first_series.get("name", "")
+        cache_path = None
+        if isinstance(base_dir, str) and base_dir:
+            try:
+                cache_dir = Path(base_dir) / 'data' / 'tvdb'
+                cache_path = cache_dir / f"{series_id_int}.json"
 
-                if names_match(series_name, title):
-                    tvdb_id = first_series.get("tvdb_id")
-                    series_year = first_series.get("year", "Unknown")
+                if cache_path.exists():
+                    with cache_path.open('r', encoding='utf-8') as f:
+                        cached = json.load(f)
 
-                    if debug:
-                        console.print(f"[green]Title match found: {series_name} ({series_year}) - ID: {tvdb_id}[/green]")
-                    return tvdb_id
+                    if isinstance(cached, dict):
+                        cached_dict = cast(dict[str, Any], cached)
+                        cached_episodes = _as_dict_list(cached_dict.get('episodes', []))
+                        if not cached_episodes and not isinstance(cached_dict.get('episodes', []), list):
+                            cached_episodes = []
+                        if not _episode_is_present(cached_episodes):
+                            if debug:
+                                console.print(
+                                    f"[yellow]Cached TVDB data for {series_id_int} does not include requested episode; refreshing from TVDB[/yellow]"
+                                )
+                        else:
+                            if debug:
+                                console.print(f"[cyan]Using cached TVDB episodes for {series_id_int}[/cyan]")
 
-                elif year:
-                    if debug:
-                        console.print(f"[yellow]Series name '{series_name}' doesn't match title '{title}'. Retrying without year...[/yellow]")
+                            episodes_data: dict[str, Any] = {
+                                'episodes': cached_episodes,
+                                'aliases': cached_dict.get('aliases', []) if isinstance(cached_dict.get('aliases', []), list) else []
+                            }
 
-                    # Second attempt: Search without year
-                    data2 = await search_tvdb(title, None, "Retry without year: ")
+                            specific_alias = None
+                            aliases_list = _as_dict_list(episodes_data.get('aliases'))
+                            if aliases_list:
+                                year_pattern = re.compile(r'\((\d{4})\)')
+                                eng_aliases = [
+                                    alias['name'] for alias in aliases_list
+                                    if alias.get('language') == 'eng' and year_pattern.search(alias.get('name', ''))
+                                ]
+                                if eng_aliases:
+                                    specific_alias = eng_aliases[-1]
+                                    if debug:
+                                        console.print(f"[blue]English alias with year: {specific_alias}[/blue]")
 
-                    if data2 and data2.get("status") == "success" and data2.get("data"):
-                        all_results2 = data2["data"]
-                        series_list2 = [item for item in all_results2 if item.get("type") == "series"]
-
-                        if debug:
-                            console.print(f"[green]Retry found {len(all_results2)} total results, {len(series_list2)} series matches[/green]")
-                            if series_list2:
-                                for i, series in enumerate(series_list2[:3]):
-                                    name = series.get("name", "Unknown")
-                                    year_found = series.get("year", "Unknown")
-                                    tvdb_id = series.get("tvdb_id", "Unknown")
-                                    console.print(f"[cyan]  {i+1}. {name} ({year_found}) - ID: {tvdb_id}[/cyan]")
-
-                        # Look for a better match in the new results
-                        for series in series_list2:
-                            series_name2 = series.get("name", "")
-                            if names_match(series_name2, title):
-                                tvdb_id = series.get("tvdb_id")
-                                series_year = series.get("year", "Unknown")
-
-                                if debug:
-                                    console.print(f"[green]Better match found without year: {series_name2} ({series_year}) - ID: {tvdb_id}[/green]")
-                                return tvdb_id
-                    else:
-                        if debug:
-                            console.print(f"[yellow]No results found in retry without year for '{title}'[/yellow]")
-                        return 0
-                else:
-                    if debug:
-                        console.print(f"[yellow]Series name '{series_name}' doesn't match title '{title}' and no year provided. No further attempts will be made.[/yellow]")
-                    return 0
-
-            else:
+                            return episodes_data, specific_alias
+            except Exception as cache_error:
                 if debug:
-                    console.print("[yellow]No series found in search results[/yellow]")
-                return 0
-        else:
-            if debug:
-                console.print(f"[yellow]No TVDb results found for '{title}' ({year or 'no year'})[/yellow]")
-                if data and data.get("message"):
-                    console.print(f"[yellow]API message: {data['message']}[/yellow]")
-            return 0
+                    console.print(f"[yellow]Failed to read TVDB cache for {series_id}: {cache_error}[/yellow]")
 
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 401:
-            console.print("[red]Invalid API key or unauthorized access to TVDb[/red]")
-        elif e.response.status_code == 404:
-            console.print(f"[yellow]No results found for '{title}' ({year or 'no year'})[/yellow]")
-        elif e.response.status_code == 400:
-            console.print("[red]Bad request - check search parameters[/red]")
-            if debug:
-                console.print(f"[red]Response: {e.response.text}[/red]")
-        else:
-            console.print(f"[red]HTTP error occurred: {e.response.status_code} - {e.response.text}[/red]")
-        return 0
-    except httpx.RequestError as e:
-        console.print(f"[red]Request error occurred: {e}[/red]")
-        return 0
-    except Exception as e:
-        console.print(f"[red]Error searching TVDb series: {e}[/red]")
-        return 0
+        try:
+            client = _get_tvdb_or_warn()
+            if client is None:
+                return None, None
 
+            # Get all episodes for the series with pagination
+            all_episodes: list[dict[str, Any]] = []
+            page = 0
+            max_pages = 20  # Safety limit to prevent infinite loops
+            pages_fetched = 0
 
-async def get_tvdb_specific_episode_data(base_dir, token, tvdb_id, id, api_key=None, retry_attempted=False, debug=False):
-    if debug:
-        console.print(f"[cyan]Fetching specific episode data for ID {id} of series ID {tvdb_id}...[/cyan]")
+            while page < max_pages:
+                if debug and page > 0:
+                    console.print(f"[cyan]Fetching TVDB episodes page {page + 1}[/cyan]")
 
-    url = f"https://api4.thetvdb.com/v4/episodes/{id}/extended?meta=translations"
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
+                try:
+                    episodes_response = cast(Any, client).get_series_episodes(
+                        series_id_int,
+                        season_type="default",
+                        page=page,
+                        lang="eng"
+                    )
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, timeout=30.0)
-
-            # Handle unauthorized responses
-            if response.status_code == 401:
-                # Only attempt a retry once to prevent infinite loops
-                if api_key and not retry_attempted:
-                    console.print("[yellow]Unauthorized access. Refreshing TVDb token...[/yellow]")
-                    new_token = await get_tvdb_token(api_key, base_dir)
-                    if new_token:
-                        # Retry the request with the new token
-                        return await get_tvdb_specific_episode_data(
-                            base_dir, new_token, tvdb_id, id, api_key, True
-                        )
+                    # Handle both dict response and direct episodes list
+                    if isinstance(episodes_response, dict):
+                        episodes_response_dict = cast(dict[str, Any], episodes_response)
+                        current_episodes = _as_dict_list(episodes_response_dict.get('episodes', []))
                     else:
-                        console.print("[red]Failed to refresh TVDb token[/red]")
-                        return None
-                else:
-                    console.print("[red]Unauthorized access to TVDb API[/red]")
-                    return None
+                        # Fallback for direct list response
+                        current_episodes = _as_dict_list(episodes_response)
 
-            response.raise_for_status()
-            data = response.json()
+                    if not current_episodes:
+                        if debug:
+                            console.print(f"[yellow]No episodes found on page {page + 1}, stopping pagination[/yellow]")
+                        break
 
-            # Check for "Unauthorized" message in response body
-            if data.get("message") == "Unauthorized":
-                if api_key and not retry_attempted:
-                    console.print("[yellow]Token invalid or expired. Refreshing TVDb token...[/yellow]")
-                    new_token = await get_tvdb_token(api_key, base_dir)
-                    if new_token:
-                        return await get_tvdb_specific_episode_data(
-                            base_dir, new_token, tvdb_id, id, api_key, True
-                        )
+                    all_episodes.extend(current_episodes)
+                    pages_fetched += 1
+
+                    if debug:
+                        console.print(f"[cyan]Retrieved {len(current_episodes)} episodes from page {page + 1} (total: {len(all_episodes)})[/cyan]")
+
+                    # If we got fewer than 500 results, we've reached the end
+                    if len(current_episodes) < 500:
+                        if debug:
+                            console.print(f"[cyan]Page {page + 1} returned {len(current_episodes)} episodes (< 500), pagination complete[/cyan]")
+                        break
+
+                    page += 1
+                    await asyncio.sleep(0.1)  # Rate limiting
+
+                except Exception as page_error:
+                    if debug:
+                        console.print(f"[yellow]Error fetching page {page + 1}: {page_error}[/yellow]")
+                    # If first page fails, re-raise; otherwise, stop pagination
+                    if page == 0:
+                        raise page_error
                     else:
-                        console.print("[red]Failed to refresh TVDb token[/red]")
-                        return None
+                        break
+
+            if debug:
+                console.print(f"[green]Total episodes retrieved: {len(all_episodes)} across {page + 1} page(s)[/green]")
+
+            # Create the response structure
+            episodes_data: dict[str, Any] = {
+                'episodes': all_episodes,
+                'aliases': []  # Will be populated if available from first response
+            }
+
+            # Try to get aliases from series info (may need separate call)
+            try:
+                if all_episodes:
+                    # Get series details for aliases
+                    series_info = cast(dict[str, Any], cast(Any, client).get_series_extended(series_id_int))
+                    if 'aliases' in series_info:
+                        episodes_data['aliases'] = series_info['aliases']
+            except Exception as alias_error:
+                if debug:
+                    console.print(f"[yellow]Could not retrieve series aliases: {alias_error}[/yellow]")
+
+            # If this was a multi-page series and we have a base_dir, cache results for next time.
+            if cache_path and pages_fetched > 1:
+                try:
+                    # Ensure cache dir exists; on POSIX explicitly apply typical dir perms.
+                    if os.name == 'posix':
+                        cache_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                        with contextlib.suppress(Exception):
+                            os.chmod(cache_path.parent, 0o700)
+                    else:
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    with cache_path.open('w', encoding='utf-8') as f:
+                        json.dump(episodes_data, f, ensure_ascii=False)
+
+                    if os.name == 'posix':
+                        with contextlib.suppress(Exception):
+                            os.chmod(cache_path, 0o644)
+                    if debug:
+                        console.print(f"[green]Cached TVDB episodes to {cache_path}[/green]")
+                except Exception as cache_write_error:
+                    if debug:
+                        console.print(f"[yellow]Failed to write TVDB cache for {series_id}: {cache_write_error}[/yellow]")
+
+            # Extract specific English alias only if it contains a year (e.g., "Cats eye (2025)")
+            specific_alias = None
+            if 'aliases' in episodes_data and episodes_data['aliases']:
+                # Pattern to match a 4-digit year in parentheses
+                year_pattern = re.compile(r'\((\d{4})\)')
+                aliases_list = _as_dict_list(episodes_data['aliases'])
+                eng_aliases = [
+                    alias['name'] for alias in aliases_list
+                    if alias.get('language') == 'eng' and year_pattern.search(alias['name'])
+                ]
+                if eng_aliases:
+                    # Get the last English alias with year (usually the most specific one)
+                    specific_alias = eng_aliases[-1]
+                    if debug:
+                        console.print(f"[blue]English alias with year: {specific_alias}[/blue]")
+
+            return episodes_data, specific_alias
+
+        except Exception as e:
+            console.print(f"[red]Error getting episodes: {e}[/red]")
+            return None, None
+
+    async def get_tvdb_by_external_id(
+        self,
+        imdb: Optional[Union[int, str]],
+        tmdb: Optional[Union[int, str]],
+        debug: bool = False,
+        tv_movie: bool = False,
+    ) -> tuple[Optional[int], Optional[str]]:
+        client = _get_tvdb_or_warn()
+        if client is None:
+            return None, None
+
+        # Try IMDB first if available
+        if imdb:
+            try:
+                if isinstance(imdb, str) and imdb.startswith('tt'):
+                    imdb_formatted = imdb
+                elif isinstance(imdb, str) and imdb.isdigit():
+                    imdb_formatted = f"tt{int(imdb):07d}"
+                elif isinstance(imdb, int):
+                    imdb_formatted = f"tt{imdb:07d}"
                 else:
-                    console.print("[red]Unauthorized response from TVDb API[/red]")
-                    return None
-            if data.get("status") == "success" and data.get("data"):
-                episode_data = data["data"]
-                series_data = episode_data.get("seasons", {})
-                season_number = episode_data.get("seasonNumber", 0)
-                episode_number = episode_data.get("number", 0)
-                season_name = ""
-                if isinstance(series_data, list) and series_data:
-                    season_name = series_data[0].get("name", "")
-                episode_name = episode_data.get("name", "")
-                air_date = episode_data.get("aired", "")
-                overview = episode_data.get("overview", "")
-                year = episode_data.get("year", "")
+                    imdb_formatted = str(imdb)
 
-                # Extract IMDB id from remoteIds
-                imdb_id = None
-                for rid in episode_data.get("remoteIds", []):
-                    if rid.get("type") == 2 and rid.get("sourceName", "").upper() == "IMDB":
-                        imdb_id = rid.get("id")
-                        break
+                if debug:
+                    console.print(f"[cyan]Trying TVDB lookup with IMDB ID: {imdb_formatted}[/cyan]")
 
-                # Extract English name from nameTranslations
-                eng_name = None
-                for nt in episode_data.get("translations", {}).get("nameTranslations", []):
-                    if nt.get("language") == "eng":
-                        eng_name = nt.get("name")
-                        break
+                results = _as_dict_list(cast(Any, client).search_by_remote_id(imdb_formatted))
+                await asyncio.sleep(0.1)
 
-                # Extract English overview from overviewTranslations
-                eng_overview = None
-                for ot in episode_data.get("translations", {}).get("overviewTranslations", []):
-                    if ot.get("language") == "eng":
-                        eng_overview = ot.get("overview")
-                        break
+                if results and len(results) > 0:
+                    if debug:
+                        console.print(f"[blue]results: {results}[/blue]")
 
-                result = {
-                    "id": id,
-                    "tvdb_id": tvdb_id,
-                    "season_number": season_number,
-                    "season_name": season_name,
-                    "episode_number": episode_number,
-                    "episode_name": episode_name,
-                    "air_date": air_date,
-                    "overview": overview,
-                    "image_url": episode_data.get("image", ""),
-                    "thumb_url": episode_data.get("thumbnail", ""),
-                    "runtime": episode_data.get("runtime", 0),
-                    "production_code": episode_data.get("productionCode", ""),
-                    "finale_type": episode_data.get("finaleType", ""),
-                    "year": year,
-                    "imdb_id": imdb_id,
-                    "eng_name": eng_name,
-                    "eng_overview": eng_overview
-                }
+                    # Look for series results first
+                    for result in results:
+                        if 'series' in result and isinstance(result.get('series'), dict):
+                            series_id = result['series']['id']
+                            series_name = result['series'].get('name')
+                            if debug:
+                                console.print(f"[blue]TVDB series ID from IMDB: {series_id}[/blue]")
+                            return _coerce_int(series_id), series_name
 
-                return result
+                    # If tv_movie is True, check for episode with seriesId first, then movie
+                    if tv_movie:
+                        # Check if any result has an episode with a seriesId
+                        for result in results:
+                            if 'episode' in result and isinstance(result.get('episode'), dict) and result['episode'].get('seriesId'):
+                                series_id = result['episode']['seriesId']
+                                series_name = result['episode'].get('seriesName')
+                                if debug:
+                                    console.print(f"[blue]TVDB series ID from episode entry (tv_movie): {series_id}[/blue]")
+                                return _coerce_int(series_id), series_name
 
-    except httpx.HTTPError as e:
-        console.print(f"[red]HTTP error occurred while fetching TVDb episode data: {e}[/red]")
-        return None
-    except Exception as e:
-        console.print(f"[red]Error occurred while fetching TVDb episode data: {e}[/red]")
-        return None
+                        # If no episode with seriesId, accept movie results
+                        for result in results:
+                            if 'movie' in result and isinstance(result.get('movie'), dict):
+                                movie_id = result['movie']['id']
+                                movie_name = result['movie'].get('name')
+                                if debug:
+                                    console.print(f"[blue]TVDB movie ID from IMDB (tv_movie): {movie_id}[/blue]")
+                                return _coerce_int(movie_id), movie_name
+
+                    if debug:
+                        result_types = [list(result.keys())[0] for result in results if result]
+                        console.print(f"[yellow]IMDB search returned results but no {'series or movie' if tv_movie else 'series'} found (got: {result_types})[/yellow]")
+                else:
+                    if debug:
+                        console.print("[yellow]No TVDB series found for IMDB ID[/yellow]")
+            except Exception as e:
+                if debug:
+                    console.print(f"[red]Error getting TVDB by IMDB ID: {e}[/red]")
+
+        if tmdb:
+            try:
+                tmdb_str = str(tmdb)
+
+                if debug:
+                    console.print(f"[cyan]Trying TVDB lookup with TMDB ID: {tmdb_str}[/cyan]")
+
+                results = _as_dict_list(cast(Any, client).search_by_remote_id(tmdb_str))
+                await asyncio.sleep(0.1)
+
+                if results and len(results) > 0:
+                    if debug:
+                        console.print(f"[blue]results: {results}[/blue]")
+
+                    # Look for series results first
+                    for result in results:
+                        if 'series' in result and isinstance(result.get('series'), dict):
+                            series_id = result['series']['id']
+                            series_name = result['series'].get('name')
+                            if debug:
+                                console.print(f"[blue]TVDB series ID from TMDB: {series_id}[/blue]")
+                            return _coerce_int(series_id), series_name
+
+                    # If tv_movie is True, check for episode with seriesId first, then movie
+                    if tv_movie:
+                        # Check if any result has an episode with a seriesId
+                        for result in results:
+                            if 'episode' in result and isinstance(result.get('episode'), dict) and result['episode'].get('seriesId'):
+                                series_id = result['episode']['seriesId']
+                                series_name = result['episode'].get('seriesName')
+                                if debug:
+                                    console.print(f"[blue]TVDB series ID from episode entry (tv_movie): {series_id}[/blue]")
+                                return _coerce_int(series_id), series_name
+
+                        # If no episode with seriesId, accept movie results
+                        for result in results:
+                            if 'movie' in result and isinstance(result.get('movie'), dict):
+                                movie_id = result['movie']['id']
+                                movie_name = result['movie'].get('name')
+                                if debug:
+                                    console.print(f"[blue]TVDB movie ID from TMDB (tv_movie): {movie_id}[/blue]")
+                                return _coerce_int(movie_id), movie_name
+
+                    if debug:
+                        result_types = [list(result.keys())[0] for result in results if result]
+                        console.print(f"[yellow]TMDB search returned results but no {'series or movie' if tv_movie else 'series'} found (got: {result_types})[/yellow]")
+                else:
+                    if debug:
+                        console.print("[yellow]No TVDB series found for TMDB ID[/yellow]")
+            except Exception as e:
+                if debug:
+                    console.print(f"[red]Error getting TVDB by TMDB ID: {e}[/red]")
+
+        result_type_str = "series or movie" if tv_movie else "series"
+        console.print(f"[yellow]No TVDB {result_type_str} found for any available external ID[/yellow]")
+        return None, None
+
+    async def get_imdb_id_from_tvdb_episode_id(
+        self,
+        episode_id: Union[int, str],
+        debug: bool = False,
+    ) -> Optional[str]:
+        try:
+            client = _get_tvdb_or_warn()
+            if client is None:
+                return None
+
+            episode_id_int = _coerce_int(episode_id)
+            if episode_id_int is None:
+                if debug:
+                    console.print(f"[yellow]Invalid TVDB episode ID: {episode_id}[/yellow]")
+                return None
+
+            episode_data = cast(dict[str, Any], cast(Any, client).get_episode_extended(episode_id_int))
+            if debug:
+                console.print(f"[yellow]Episode data retrieved for episode ID {episode_id}[/yellow]")
+
+            remote_ids = _as_dict_list(episode_data.get('remoteIds', []))
+            imdb_id = None
+
+            for remote_id in remote_ids:
+                if remote_id.get('type') == 2 or remote_id.get('sourceName') == 'IMDB':
+                    imdb_id = remote_id.get('id')
+                    break
+
+            if imdb_id and debug:
+                console.print(f"[blue]TVDB episode ID: {episode_id} maps to IMDB ID: {imdb_id}[/blue]")
+            elif debug:
+                console.print(f"[yellow]No IMDB ID found for TVDB episode ID: {episode_id}[/yellow]")
+
+            return imdb_id
+        except Exception as e:
+            console.print(f"[red]Error getting IMDB ID from TVDB episode ID: {e}[/red]")
+            return None
+
+    async def get_specific_episode_data(
+        self,
+        data: Any,
+        season: Optional[Union[int, str]],
+        episode: Optional[Union[int, str]],
+        debug: bool = False,
+        aired_date: Optional[str] = None,
+    ) -> tuple[
+        Optional[Any],
+        Optional[Any],
+        Optional[Any],
+        Optional[Any],
+        Optional[Any],
+        Optional[Any],
+        Optional[Any],
+    ]:
+        if debug:
+            console.print("[yellow]Getting specific episode data from TVDB data[/yellow]")
+
+        # Handle both dict (full series data) and list (episodes only) formats
+        if isinstance(data, dict):
+            data_dict = cast(dict[str, Any], data)
+            episodes = _as_dict_list(data_dict.get('episodes', []))
+        elif isinstance(data, list):
+            episodes = _as_dict_list(data)
+        else:
+            console.print("[red]No episode data available or invalid format[/red]")
+            return None, None, None, None, None, None, None
+
+        if not episodes:
+            console.print("[red]No episodes found in data[/red]")
+            return None, None, None, None, None, None, None
+
+        # Convert season and episode to int for comparison
+        try:
+            season_int = int(season) if season is not None else None
+            episode_int = int(episode) if episode is not None and episode != 0 else None
+        except (ValueError, TypeError) as e:
+            console.print(f"[red]Invalid season or episode format: season={season}, episode={episode}, error={e}[/red]")
+            return None, None, None, None, None, None, None
+
+        if season_int is None:
+            console.print(f"[red]Season is None after conversion: season_int={season_int}[/red]")
+            return None, None, None, None, None, None, None
+
+        if debug:
+            console.print(f"[blue]Total episodes retrieved from TVDB: {len(episodes)}[/blue]")
+            console.print(f"[blue]Looking for Season: {season_int}, Episode: {episode_int}[/blue]")
+
+        # For daily shows, match by air date if provided.
+        if aired_date:
+            aired_norm = str(aired_date).strip().replace('.', '-')
+            for ep in episodes:
+                if ep.get('aired') == aired_norm:
+                    if debug:
+                        console.print(f"[green]Matched daily episode by air date {aired_norm}: S{ep.get('seasonNumber'):02d}E{ep.get('number'):02d} - {ep.get('name')}[/green]")
+                    return (
+                        ep.get('seasonName'),
+                        ep.get('name'),
+                        ep.get('overview'),
+                        ep.get('seasonNumber'),
+                        ep.get('number'),
+                        ep.get('year'),
+                        ep.get('id')
+                    )
+
+        # If episode_int is None or 0, return first episode of the season
+        if episode_int is None or episode_int == 0:
+            for ep in episodes:
+                if ep.get('seasonNumber') == season_int:
+                    if debug:
+                        console.print(f"[green]Found first episode of season {season_int}: S{season_int:02d}E{ep.get('number'):02d} - {ep.get('name')}[/green]")
+                    return (
+                        ep.get('seasonName'),
+                        ep.get('name'),
+                        ep.get('overview'),
+                        ep.get('seasonNumber'),
+                        ep.get('number'),
+                        ep.get('year'),
+                        ep.get('id')
+                    )
+
+        # Try to find exact season/episode match
+        for ep in episodes:
+            if ep.get('seasonNumber') == season_int and ep.get('number') == episode_int:
+                if debug:
+                    console.print(f"[green]Found exact match: S{season_int:02d}E{episode_int:02d} - {ep.get('name')}[/green]")
+                return (
+                    ep.get('seasonName'),
+                    ep.get('name'),
+                    ep.get('overview'),
+                    ep.get('seasonNumber'),
+                    ep.get('number'),
+                    ep.get('year'),
+                    ep.get('id')
+                )
+
+        # Try to find an episode with this absolute number directly
+        console.print("[yellow]No exact match found, trying absolute number mapping...[/yellow]")
+        for ep in episodes:
+            if ep.get('absoluteNumber') == episode_int:
+                mapped_season = ep.get('seasonNumber')
+                mapped_episode = ep.get('number')
+                if debug:
+                    console.print(f"[green]Mapped absolute #{episode_int} -> S{mapped_season:02d}E{mapped_episode:02d} - {ep.get('name')}[/green]")
+                return (
+                    ep.get('seasonName'),
+                    ep.get('name'),
+                    ep.get('overview'),
+                    ep.get('seasonNumber'),
+                    ep.get('number'),
+                    ep.get('year'),
+                    ep.get('id')
+                )
+
+        console.print(f"[red]Could not find episode for S{season_int:02d}E{episode_int:02d} or absolute #{episode_int}[/red]")
+        return None, None, None, None, None, None, None

@@ -1,170 +1,373 @@
-# -*- coding: utf-8 -*-
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
 # import discord
-import asyncio
-from torf import Torrent
-import requests
-from src.console import console
-from pprint import pprint
 import base64
-import shutil
+import glob
 import os
-import traceback
+import re
+import unicodedata
+from typing import Any, Optional, cast
+
+import aiofiles
 import httpx
-from src.trackers.COMMON import COMMON
+
+from cogs.redaction import Redaction
+from src.bbcode import BBCODE
+from src.console import console
+from src.get_desc import DescriptionBuilder
+from src.languages import languages_manager
+
+from .COMMON import COMMON
+
+Meta = dict[str, Any]
+Config = dict[str, Any]
 
 
-class SPD():
-
-    def __init__(self, config):
+class SPD:
+    def __init__(self, config: Config) -> None:
         self.url = "https://speedapp.io"
-        self.config = config
+        self.config: Config = config
+        self.common = COMMON(config)
         self.tracker = 'SPD'
-        self.source_flag = 'speedapp.io'
-        self.search_url = 'https://speedapp.io/api/torrent'
         self.upload_url = 'https://speedapp.io/api/upload'
-        self.forum_link = 'https://speedapp.io/support/wiki/rules'
-        self.banned_groups = ['']
-        pass
-
-    async def upload(self, meta, disctype):
-        common = COMMON(config=self.config)
-        await common.edit_torrent(meta, self.tracker, self.source_flag)
-        type_id = ""
-        if meta['anime']:
-            type_id = '3'
-        elif meta['category'] == 'TV':
-            if meta['tv_pack']:
-                type_id = '41'
-            elif meta['sd'] and not meta['tv_pack']:
-                type_id = '45'
-            # must be hd
-            else:
-                type_id = '43'
-        else:
-            if meta['type'] != "DISC" and meta['resolution'] == "2160p":
-                type_id = '61'
-            else:
-                type_id = {
-                    'DISC': '17',
-                    'REMUX': '8',
-                    'WEBDL': '8',
-                    'WEBRIP': '8',
-                    'HDTV': '8',
-                    'SD': '10',
-                    'ENCODE': '8'
-                }.get(type, '0')
-
-        if meta['bdinfo'] is not None:
-            mi_dump = None
-            bd_dump = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/BD_SUMMARY_00.txt", 'r', encoding='utf-8').read()
-        else:
-            mi_dump = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/MEDIAINFO_CLEANPATH.txt", 'r', encoding='utf-8').read()
-            bd_dump = None
-        screenshots = []
-        if len(meta['image_list']) != 0:
-            for image in meta['image_list']:
-                screenshots.append(image['raw_url'])
-        data = {
-            'name': meta['name'].replace("'", '').replace(': ', '.').replace(':', '.').replace('  ', '.').replace(' ', '.').replace('DD+', 'DDP'),
-            'screenshots': screenshots,
-            'release_info': f"[center][url={self.forum_link}]Please seed[/url][/center]",
-            'media_info': mi_dump,
-            'bd_info': bd_dump,
-            'type': type_id,
-            'url': f"https://www.imdb.com/title/tt{meta['imdb']}",
-            'shortDescription': meta['genres'],
-            'keywords': meta['keywords'],
-            'releaseInfo': self.forum_link
-        }
-        with open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}].torrent", 'rb') as binary_file:
-            binary_file_data = binary_file.read()
-            base64_encoded_data = base64.b64encode(binary_file_data)
-            base64_message = base64_encoded_data.decode('utf-8')
-            data['file'] = base64_message
-
-        headers = {'Authorization': 'Bearer ' + self.config['TRACKERS'][self.tracker]['api_key'].strip()}
-
-        if meta['debug'] is False:
-            response = requests.request("POST", url=self.upload_url, json=data, headers=headers)
-            try:
-                if response.status_code == 200:
-                    # response = {'status': True, 'error': False, 'downloadUrl': '/api/torrent/383435/download', 'torrent': {'id': 383435, 'name': 'name-with-full-stops', 'slug': 'name-with-dashs', 'category_id': 3}}
-                    # downloading the torrent from site as it adds a tonne of different trackers and the source is different all the time.
-                    try:
-                        # torrent may not dl and may not provide error if machine is under load or network connection usage high.
-                        if 'downloadUrl' in response.json():
-                            meta['tracker_status'][self.tracker]['status_message'] = response.json()['downloadUrl']
-                            with requests.get(url=self.url + response.json()['downloadUrl'], stream=True, headers=headers) as r:
-                                # replacing L4g/torf created torrent so it will be added to the client.
-                                with open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}].torrent",
-                                          'wb') as f:
-                                    shutil.copyfileobj(r.raw, f)
-                            # adding as comment link to torrent
-                            if os.path.exists(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}].torrent"):
-                                new_torrent = Torrent.read(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}].torrent")
-                                new_torrent.metainfo['comment'] = f"{self.url}/browse/{response.json()['torrent']['id']}"
-                                Torrent.copy(new_torrent).write(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}].torrent", overwrite=True)
-                        else:
-                            console.print("[bold red]No downloadUrl in response.")
-                            console.print("[bold red]Confirm it uploaded correctly and try to download manually")
-                            console.print({response.json()})
-                    except Exception:
-                        console.print(traceback.print_exc())
-                        console.print("[red]Unable to Download torrent, try manually")
-                        console.print({response.json()})
-                else:
-                    console.print(f"[bold red]Failed to upload got status code: {response.status_code}")
-            except Exception:
-                console.print(traceback.print_exc())
-                console.print("[yellow]Unable to Download torrent, try manually")
-                return
-        else:
-            console.print("[cyan]Request Data:")
-            pprint(data)
-            meta['tracker_status'][self.tracker]['status_message'] = "Debug mode enabled, not uploading."
-
-    async def get_cat_id(self, category_name):
-        category_id = {
-            'MOVIE': '1',
-            'TV': '2',
-            'FANRES': '3'
-        }.get(category_name, '0')
-        return category_id
-
-    async def search_existing(self, meta, disctype):
-        dupes = []
-        headers = {
+        self.torrent_url = 'https://speedapp.io/browse/'
+        self.banned_groups = []
+        self.banned_url = 'https://speedapp.io/api/torrent/release-group/blacklist'
+        api_key = str(self.config['TRACKERS'][self.tracker]['api_key'])
+        self.session = httpx.AsyncClient(headers={
+            'User-Agent': "Upload Assistant",
             'accept': 'application/json',
-            'Authorization': self.config['TRACKERS'][self.tracker]['api_key'].strip(),
-        }
+            'Authorization': api_key,
+        }, timeout=30.0)
 
-        params = {
-            'includingDead': '1'
-        }
+    async def get_cat_id(self, meta: Meta) -> Optional[str]:
+        if not meta.get('language_checked', False):
+            await languages_manager.process_desc_language(meta, tracker=self.tracker)
 
-        if meta['imdb_id'] != 0:
-            params['imdbId'] = f"tt{meta['imdb']}"
+        subtitle_langs = cast(list[Any], meta.get('subtitle_languages', []))
+        audio_langs = cast(list[Any], meta.get('audio_languages', []))
+        langs = [str(lang).lower() for lang in subtitle_langs + audio_langs]
+        romanian = 'romanian' in langs
+
+        origin_countries = cast(list[Any], meta.get('origin_country', []))
+        category = str(meta.get('category', ''))
+        if 'RO' in origin_countries:
+            if category == 'TV':
+                return '60'
+            elif category == 'MOVIE':
+                return '59'
+
+        # documentary
+        genres = str(meta.get("genres", ""))
+        keywords = str(meta.get("keywords", ""))
+        if 'documentary' in genres.lower() or 'documentary' in keywords.lower():
+            return '63' if romanian else '9'
+
+        # anime
+        if meta.get('anime'):
+            return '3'
+
+        # TV
+        if category == 'TV':
+            if meta.get('tv_pack'):
+                return '66' if romanian else '41'
+            elif meta.get('sd'):
+                return '46' if romanian else '45'
+            return '44' if romanian else '43'
+
+        # MOVIE
+        if category == 'MOVIE':
+            resolution = str(meta.get('resolution', ''))
+            media_type = str(meta.get('type', ''))
+            if resolution == '2160p' and media_type != 'DISC':
+                return '57' if romanian else '61'
+            if media_type in ('REMUX', 'WEBDL', 'WEBRIP', 'HDTV', 'ENCODE'):
+                return '29' if romanian else '8'
+            if media_type == 'DISC':
+                return '24' if romanian else '17'
+            if media_type == 'SD':
+                return '35' if romanian else '10'
+
+        return None
+
+    async def get_file_info(self, meta: Meta) -> tuple[Optional[str], Optional[str]]:
+        base_path = f"{meta['base_dir']}/tmp/{meta['uuid']}"
+
+        if meta.get('bdinfo'):
+            async with aiofiles.open(
+                f"{base_path}/BD_SUMMARY_00.txt",
+                encoding='utf-8',
+            ) as bd_file:
+                bd_info = await bd_file.read()
+            return None, bd_info
         else:
-            params['search'] = meta['title'].replace(':', '').replace("'", '').replace(",", '')
+            async with aiofiles.open(
+                f"{base_path}/MEDIAINFO_CLEANPATH.txt",
+                encoding='utf-8',
+            ) as mi_file:
+                media_info = await mi_file.read()
+            return media_info, None
+
+    async def get_screenshots(self, meta: Meta) -> list[str]:
+        images = cast(list[dict[str, Any]], meta.get('menu_images', [])) + cast(
+            list[dict[str, Any]], meta.get('image_list', [])
+        )
+        return [image['raw_url'] for image in images if image.get('raw_url')]
+
+    async def search_existing(self, meta: Meta, _disctype: str) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        search_url = 'https://speedapp.io/api/torrent'
+
+        params: dict[str, str] = {}
+        if int(meta.get('imdb_id', 0) or 0) != 0:
+            imdb_info = cast(dict[str, Any], meta.get('imdb_info', {}))
+            params['imdbId'] = str(imdb_info.get('imdbID', ''))
+        else:
+            search_title = str(meta.get('title', '')).replace(':', '').replace("'", '').replace(',', '')
+            params['search'] = search_title
 
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(url=self.search_url, params=params, headers=headers)
-                if response.status_code == 200:
-                    data = response.json()
-                    for each in data:
-                        result = [each][0]['name']
-                        dupes.append(result)
+            response = await self.session.get(url=search_url, params=params, headers=self.session.headers)
+
+            if response.status_code == 200:
+                data = cast(list[dict[str, Any]], response.json())
+                for each in data:
+                    name = each.get('name')
+                    size = each.get('size')
+                    link = f'{self.torrent_url}{each.get("id")}/'
+
+                    if name:
+                        results.append({
+                            'name': str(name),
+                            'size': size,
+                            'link': link
+                        })
+                return results
+            else:
+                console.print(f'[bold red]HTTP request failed. Status: {response.status_code}')
+
+        except Exception as e:
+            console.print(f'[bold red]Unexpected error: {e}')
+            console.print_exception()
+
+        return results
+
+    async def search_channel(self, meta: Meta) -> Optional[int]:
+        spd_channel = meta.get('spd_channel', '') or self.config['TRACKERS'][self.tracker].get('channel', '')
+
+        # if no channel is specified, use the default
+        if not spd_channel:
+            return 1
+
+        # return the channel as int if it's already an integer
+        if isinstance(spd_channel, int):
+            return spd_channel
+
+        # if user enters id as a string number
+        if isinstance(spd_channel, str):
+            if spd_channel.isdigit():
+                return int(spd_channel)
+            # if user enter tag then it will use API to search
+            else:
+                pass
+
+        params: dict[str, str] = {
+            'search': str(spd_channel)
+        }
+
+        try:
+            response = await self.session.get(url=self.url + '/api/channel', params=params, headers=self.session.headers)
+
+            if response.status_code == 200:
+                data = cast(list[dict[str, Any]], response.json())
+                for entry in data:
+                    channel_id = entry.get('id')
+                    tag = entry.get('tag')
+
+                    if channel_id and tag:
+                        if tag != spd_channel:
+                            console.print(f'[{self.tracker}]: Unable to find a matching channel based on your input. Please check if you entered it correctly.')
+                            return
+                        else:
+                            return int(channel_id)
+                    else:
+                        console.print(f'[{self.tracker}]: Could not find the channel ID. Please check if you entered it correctly.')
+
                 else:
                     console.print(f"[bold red]HTTP request failed. Status: {response.status_code}")
 
-        except httpx.TimeoutException:
-            console.print("[bold red]Request timed out while searching for existing torrents.")
-        except httpx.RequestError as e:
-            console.print(f"[bold red]An error occurred while making the request: {e}")
         except Exception as e:
             console.print(f"[bold red]Unexpected error: {e}")
             console.print_exception()
-            await asyncio.sleep(5)
 
-        return dupes
+    async def edit_desc(self, meta: Meta) -> str:
+        builder = DescriptionBuilder(self.tracker, self.config)
+        desc_parts: list[str] = []
+
+        user_description = await builder.get_user_description(meta)
+        title, episode_image, episode_overview = await builder.get_tv_info(meta, resize=True)
+        if user_description or episode_overview:  # Avoid unnecessary descriptions
+            # Custom Header
+            desc_parts.append(await builder.get_custom_header())
+
+            # Logo
+            logo_resize_url = str(meta.get('tmdb_logo', ''))
+            if logo_resize_url:
+                desc_parts.append(f"[center][img]https://image.tmdb.org/t/p/w300/{logo_resize_url}[/img][/center]")
+
+            # TV
+            if episode_overview:
+                desc_parts.append(f'[center]{title}[/center]')
+
+                if episode_image:
+                    desc_parts.append(f"[center][img]{episode_image}[/img][/center]")
+
+                desc_parts.append(f'[center]{episode_overview}[/center]')
+
+            # User description
+            desc_parts.append(user_description)
+
+        # Tonemapped Header
+        desc_parts.append(await builder.get_tonemapped_header(meta))
+
+        # Signature
+        desc_parts.append(
+            f"[url=https://github.com/Audionut/Upload-Assistant]{meta.get('ua_signature', '')}[/url]"
+        )
+
+        description = '\n\n'.join(part for part in desc_parts if part.strip())
+
+        bbcode = BBCODE()
+        description = bbcode.remove_img_resize(description)
+        description = bbcode.convert_named_spoiler_to_normal_spoiler(description)
+        description = bbcode.remove_extra_lines(description)
+
+        async with aiofiles.open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}]DESCRIPTION.txt", 'w', encoding='utf-8') as description_file:
+            await description_file.write(description)
+
+        return description
+
+    async def edit_name(self, meta: Meta) -> str:
+        torrent_name = str(meta.get('name', ''))
+
+        name = torrent_name.replace(':', ' -')
+        name = unicodedata.normalize("NFKD", name)
+        name = name.encode("ascii", "ignore").decode("ascii")
+        name = re.sub(r'[\\/*?"<>|]', '', name)
+
+        return re.sub(r"\s{2,}", " ", name)
+
+    async def encode_to_base64(self, file_path: str) -> str:
+        async with aiofiles.open(file_path, 'rb') as binary_file:
+            binary_file_data = await binary_file.read()
+            base64_encoded_data = base64.b64encode(binary_file_data)
+            return base64_encoded_data.decode('utf-8')
+
+    async def get_nfo(self, meta: Meta) -> Optional[str]:
+        nfo_dir = os.path.join(meta['base_dir'], "tmp", meta['uuid'])
+        nfo_files = glob.glob(os.path.join(nfo_dir, "*.nfo"))
+
+        if nfo_files:
+            nfo = await self.encode_to_base64(nfo_files[0])
+            return nfo
+
+        return None
+
+    async def fetch_data(self, meta: Meta) -> dict[str, Any]:
+        media_info, bd_info = await self.get_file_info(meta)
+
+        data: dict[str, Any] = {
+            'bdInfo': bd_info,
+            'coverPhotoUrl': str(meta.get('backdrop', '')),
+            'description': str(meta.get('genres', '')),
+            'media_info': media_info,
+            'name': await self.edit_name(meta),
+            'nfo': await self.get_nfo(meta),
+            'plot': str(meta.get('overview_meta', '') or meta.get('overview', '')),
+            'poster': str(meta.get('poster', '')),
+            'technicalDetails': await self.edit_desc(meta),
+            'screenshots': await self.get_screenshots(meta),
+            'type': await self.get_cat_id(meta),
+            'url': str(cast(dict[str, Any], meta.get('imdb_info', {})).get('imdb_url', '')),
+        }
+
+        data['file'] = await self.encode_to_base64(f"{meta['base_dir']}/tmp/{meta['uuid']}/BASE.torrent")
+        if meta.get('debug') is True:
+            data['file'] = str(data['file'])[:50] + '...[DEBUG MODE]'
+            if data.get('nfo'):
+                data['nfo'] = str(data['nfo'])[:50] + '...[DEBUG MODE]'
+
+        return data
+
+    async def upload(self, meta: Meta, _disctype: str) -> Optional[bool]:
+        data = await self.fetch_data(meta)
+        tracker_status = cast(dict[str, Any], meta.get('tracker_status', {}))
+        tracker_status.setdefault(self.tracker, {})
+
+        channel = await self.search_channel(meta)
+        if channel is None:
+            meta['skipping'] = f"{self.tracker}"
+            return
+        channel = str(channel)
+        data['channel'] = channel
+
+        torrent_id = ''
+
+        if not bool(meta.get('debug')):
+            response = None
+            try:
+                response = await self.session.post(url=self.upload_url, json=data, headers=self.session.headers)
+                response.raise_for_status()
+                response = response.json()
+                if response.get('status') is True and response.get('error') is False:
+                    tracker_status[self.tracker]['status_message'] = "Torrent uploaded successfully."
+
+                    if 'downloadUrl' in response:
+                        torrent_id = str(response.get('torrent', {}).get('id', ''))
+                        if torrent_id:
+                            tracker_status[self.tracker]['torrent_id'] = torrent_id
+
+                        download_url = f"{self.url}/api/torrent/{torrent_id}/download"
+                        await self.common.download_tracker_torrent(
+                            meta,
+                            tracker=self.tracker,
+                            headers={'Authorization': str(self.config['TRACKERS'][self.tracker]['api_key'])},
+                            downurl=download_url
+                        )
+                        return True
+
+                    else:
+                        tracker_status[self.tracker]['status_message'] = (
+                            'data error: No downloadUrl in response, check manually if it uploaded. '
+                            f'Response: \n{response}'
+                        )
+                        return False
+
+                else:
+                    tracker_status[self.tracker]['status_message'] = f'data error: {response}'
+                    return False
+
+            except httpx.HTTPStatusError as e:
+                tracker_status[self.tracker]['status_message'] = f'data error: HTTP {e.response.status_code} - {e.response.text}'
+                return False
+            except httpx.TimeoutException:
+                tracker_status[self.tracker]['status_message'] = f'data error: Request timed out after {self.session.timeout.write} seconds'
+                return False
+            except httpx.RequestError as e:
+                response_info = "no response"
+                if response is not None:
+                    response_info = getattr(response, 'text', str(response))
+                tracker_status[self.tracker]['status_message'] = f'data error: Unable to upload. Error: {e!r}.\nResponse: {response_info}'
+                return False
+            except Exception as e:
+                response_info = "no response"
+                if response is not None:
+                    response_info = getattr(response, 'text', str(response))
+                tracker_status[self.tracker]['status_message'] = f'data error: It may have uploaded, go check. Error: {e!r}.\nResponse: {response_info}'
+                return False
+
+        else:
+            console.print("[cyan]SPD Request Data:")
+            console.print(Redaction.redact_private_info(data))
+            tracker_status[self.tracker]['status_message'] = "Debug mode enabled, not uploading."
+            await self.common.create_torrent_for_upload(meta, f"{self.tracker}" + "_DEBUG", f"{self.tracker}" + "_DEBUG", announce_url="https://fake.tracker")
+            return True  # Debug mode - simulated success

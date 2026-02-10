@@ -1,17 +1,20 @@
-[![Create and publish a Docker image](https://github.com/Audionut/Upload-Assistant/actions/workflows/docker-image.yml/badge.svg?branch=master)](https://github.com/Audionut/Upload-Assistant/actions/workflows/docker-image.yml) [![Test run (Master Branch)](https://img.shields.io/github/actions/workflow/status/Audionut/Upload-Assistant/test-run.yaml?branch=master&label=Test%20run%20(Master%20Branch%202025-07-04%2006:06%20UTC))](https://github.com/Audionut/Upload-Assistant/actions/workflows/test-run.yaml?query=branch%3Amaster) [![Test run (5.1.5.2)](https://img.shields.io/github/actions/workflow/status/Audionut/Upload-Assistant/test-run.yaml?branch=5.1.5.2&label=Test%20run%20(5.1.5.2%202025-07-19%2014:24%20UTC))](https://github.com/Audionut/Upload-Assistant/actions/workflows/test-run.yaml?query=branch%3A5.1.5.2)
+[![Create and publish a Docker image](https://github.com/Audionut/Upload-Assistant/actions/workflows/docker-image.yml/badge.svg?branch=master)](https://github.com/Audionut/Upload-Assistant/actions/workflows/docker-image.yml)
+[![Python Code Analysis](https://github.com/Audionut/Upload-Assistant/actions/workflows/python-code-analysis.yml/badge.svg?branch=master)](https://github.com/Audionut/Upload-Assistant/actions/workflows/python-code-analysis.yml)
+[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://www.python.org/downloads/)
+[![Security: Bandit](https://img.shields.io/badge/security-bandit-yellow.svg)](https://github.com/PyCQA/bandit)
+[![Security: Safety](https://img.shields.io/badge/security-safety-green.svg)](https://github.com/pyupio/safety)
+[![Lint: Ruff](https://img.shields.io/badge/lint-ruff-4B8BBE.svg?logo=ruff&logoColor=white)](https://github.com/astral-sh/ruff)
+[![Type Checker: Pyright](https://img.shields.io/badge/type%20checker-pyright-2D7FF9.svg?logo=python&logoColor=white)](https://github.com/microsoft/pyright)
 
 Discord support https://discord.gg/QHHAZu7e2A
 
-# Audionut's Upload Assistant
+# Upload Assistant
 
 A simple tool to take the work out of uploading.
 
 This project is a fork of the original work of L4G https://github.com/L4GSP1KE/Upload-Assistant
 Immense thanks to him for establishing this project. Without his (and supporters) time and effort, this fork would not be a thing.
-What started as simply pushing some pull requests to keep the main repo inline, as L4G seemed busy with IRL, has since snowballed into full time development, bugs and all.
-
-Many other forks exist, most are simply a rebranding of this fork without any credit whatsoever.
-Better just to be on this fork and bug me about my bugs, rather than bugging someone who can ctrl+c/ctrl+v, but likely can't fix the bugs.
+Many thanks to all who have contributed.
 
 ## What It Can Do:
   - Generates and Parses MediaInfo/BDInfo.
@@ -24,6 +27,7 @@ Better just to be on this fork and bug me about my bugs, rather than bugging som
   - Generates custom .torrents without useless top level folders/nfos.
   - Can re-use existing torrents instead of hashing new.
   - Can automagically search qBitTorrent version 5+ clients for matching existing torrent.
+  - Includes support for [qui](https://github.com/autobrr/qui)
   - Generates proper name for your upload using Mediainfo/BDInfo and TMDb/IMDb conforming to site rules.
   - Checks for existing releases already on site.
   - Adds to your client with fast resume, seeding instantly (rtorrent/qbittorrent/deluge/watch folder).
@@ -31,47 +35,46 @@ Better just to be on this fork and bug me about my bugs, rather than bugging som
   - Currently works with .mkv/.mp4/Blu-ray/DVD/HD-DVDs.
 
 ## Supported Sites:
-<table>
-  <tr>
-    <td align="center"><b>Name</b></td><td align="center"><b>Acronym</b></td>
-    <td align="center"><b>Name</b></td><td align="center"><b>Acronym</b></td>
-  </tr>
-  <tr><td>Aither</td><td>AITHER</td><td>Alpharatio</td><td>AR</td></tr>
-  <tr><td>Amigos Share Club</td><td>ASC</td><td>AnimeLovers</td><td>AL</td></tr>
-  <tr><td>Anthelion</td><td>ANT</td><td>AsianCinema</td><td>ACM</td></tr>
-  <tr><td>Beyond-HD</td><td>BHD</td><td>BitHDTV</td><td>BHDTV</td></tr>
-  <tr><td>BrasilJapão-Share</td><td>BJS</td><td>Blutopia</td><td>BLU</td></tr>
-  <tr><td>BrasilTracker</td><td>BT</td><td>CapybaraBR</td><td>CBR</td></tr>
-  <tr><td>Cinematik</td><td>TIK</td><td>DarkPeers</td><td>DP</td></tr>
-  <tr><td>DigitalCore</td><td>DC</td><td>FearNoPeer</td><td>FNP</td></tr>
-  <tr><td>FileList</td><td>FL</td><td>Friki</td><td>FRIKI</td></tr>
-  <tr><td>hawke-uno</td><td>HUNO</td><td>HDBits</td><td>HDB</td></tr>
-  <tr><td>HD-Space</td><td>HDS</td><td>HD-Torrents</td><td>HDT</td></tr>
-  <tr><td>HomieHelpDesk</td><td>HHD</td><td>ItaTorrents</td><td>ITT</td></tr>
-  <tr><td>Last Digital Underground</td><td>LDU</td><td>Lat-Team</td><td>LT</td></tr>
-  <tr><td>Locadora</td><td>LCD</td><td>LST</td><td>LST</td></tr>
-  <tr><td>MoreThanTV</td><td>MTV</td><td>Nebulance</td><td>NBL</td></tr>
-  <tr><td>OldToonsWorld</td><td>OTW</td><td>OnlyEncodes+</td><td>OE</td></tr>
-  <tr><td>PassThePopcorn</td><td>PTP</td><td>Polish Torrent</td><td>PTT</td></tr>
-  <tr><td>Portugas</td><td>PT</td><td>PTerClub</td><td>PTER</td></tr>
-  <tr><td>Racing4Everyone</td><td>R4E</td><td>Rastastugan</td><td>RAS</td></tr>
-  <tr><td>ReelFLiX</td><td>RF</td><td>RocketHD</td><td>RHD</td></tr>
-  <tr><td>PrivateHD</td><td>PHD</td><td>Racing4Everyone</td><td>R4E</td></tr>
-  <tr><td>Rastastugan</td><td>RAS</td><td>ReelFLiX</td><td>RF</td></tr>
-  <tr><td>RetroFlix</td><td>RTF</td><td>Samaritano</td><td>SAM</td></tr>
-  <tr><td>seedpool</td><td>SP</td><td>Shareisland</td><td>SHRI</td></tr>
-  <tr><td>SkipTheCommericals</td><td>STC</td><td>SpeedApp</td><td>SPD</td></tr>
-  <tr><td>Swarmazon</td><td>SN</td><td>Toca Share</td><td>TOCA</td></tr>
-  <tr><td>TorrentHR</td><td>THR</td><td>TorrentLeech</td><td>TL</td></tr>
-  <tr><td>ToTheGlory</td><td>TTG</td><td>TVChaosUK</td><td>TVC</td></tr>
-  <tr><td>UHDShare</td><td>UHD</td><td>ULCX</td><td>ULCX</td></tr>
-  <tr><td>UTOPIA</td><td>UTP</td><td>YOiNKED</td><td>YOINK</td></tr>
-  <tr><td>YUSCENE</td><td>YUS</td><td></td><td></td></tr>
-</table>
+
+|Name|Acronym|Name|Acronym|
+|-|:-:|-|:-:|
+|Aither|AITHER|Alpharatio|AR|
+|Amigos-Share|ASC|Anthelion|ANT|
+|AsianCinema|ACM|Aura4K|A4K|
+|AvistaZ|AZ|Beyond-HD|BHD|
+|BitHDTV|BHDTV|Blutopia|BLU|
+|BrasilJapão-Share|BJS|BrasilTracker|BT|
+|CapybaraBR|CBR|CinemaZ|CZ|
+|Cinematik|TIK|DarkPeers|DP|
+|DigitalCore|DC|Emuwarez|EMUW|
+|FearNoPeer|FNP|FileList|FL|
+|Friki|FRIKI|FunFile|FF|
+|GreatPosterWall|GPW|hawke-uno|HUNO|
+|HDBits|HDB|HD-Space|HDS|
+|HD-Torrents|HDT|HomieHelpDesk|HHD|
+|ImmortalSeed|IS|InfinityHD|IHD|
+|ItaTorrents|ITT|LastDigitalUnderground|LDU|
+|Lat-Team|LT|Locadora|LCD|
+|LST|LST|Luminarr|LUME|
+|MoreThanTV|MTV|Nebulance|NBL|
+|OldToonsWorld|OTW|OnlyEncodes+|OE|
+|PassThePopcorn|PTP|PolishTorrent|PTT|
+|Portugas|PT|PrivateHD|PHD|
+|PTerClub|PTER|PTSKIT|PTS|
+|Racing4Everyone|R4E|Rastastugan|RAS|
+|RocketHD|RHD|ReelFLiX|RF|
+|RetroFlix|RTF|Samaritano|SAM|
+|seedpool|SP|ShareIsland|SHRI|
+|SkipTheCommerials|STC|SpeedApp|SPD|
+|Swarmazon|SN|The Leach Zone|TLZ|
+|TheOldSchool|TOS|ToTheGlory|TTG|
+|TorrentHR|THR|Torrenteros|TTR|
+|TorrentLeech|TL|TVChaosUK|TVC|
+|ULCX|ULCX|UTOPIA|UTP|
+|YOiNKED|YOINK|YUSCENE|YUS|
 
 ## **Setup:**
    - **REQUIRES AT LEAST PYTHON 3.9 AND PIP3**
-   - Needs [mono](https://www.mono-project.com/) on linux systems for BDInfo
    - Also needs MediaInfo and ffmpeg installed on your system
       - On Windows systems, ffmpeg must be added to PATH (https://windowsloop.com/install-ffmpeg-windows-10/)
       - On linux systems, get it from your favorite package manager
@@ -90,8 +93,9 @@ Better just to be on this fork and bug me about my bugs, rather than bugging som
       - Then install the requirements `pip install -r requirements.txt`
    - From the installation directory, run `python3 config-generator.py`
    - OR
-   - Copy and Rename `data/example-config.py` to `data/config.py`
-   - Edit `config.py` to use your information (more detailed information in the [wiki](https://github.com/Audionut/Upload-Assistant/wiki))
+   - Copy `data/example-config.py` to `data/config.py`, leaving `data/example-config.py` intact.
+   - NOTE: New users who use the webui will have the config file generated automatically.
+   - Edit `config.py` to use your information (more detailed information in example config options: [docs/example-config.md](docs/example-config.md))
       - tmdb_api key can be obtained from https://www.themoviedb.org/settings/api
       - image host api keys can be obtained from their respective sites
 
@@ -113,11 +117,15 @@ Better just to be on this fork and bug me about my bugs, rather than bugging som
 
   Args are OPTIONAL and ALWAYS follow path, for a list of acceptable args, pass `--help`.
   Path works best in quotes.
+  - CLI arguments: [docs/cli-args.md](docs/cli-args.md)
 
 ## **Docker Usage:**
-  Visit our wonderful [docker usage wiki page](https://github.com/Audionut/Upload-Assistant/wiki/Docker)
+  Visit our wonderful [docker usage](docs/docker-wiki-full.md)
 
-  Also see this excellent video put together by a community memeber https://videos.badkitty.zone/ua
+  Also see this excellent video put together by a community member https://videos.badkitty.zone/ua
+
+  Web UI setup (Docker GUI / Unraid): [docs/docker-gui-wiki-full.md](docs/docker-gui-wiki-full.md)
+  Web UI docs: [docs/web-ui.md](docs/web-ui.md)
 
 ## **Attributions:**
 
@@ -125,6 +133,7 @@ Built with updated BDInfoCLI from https://github.com/rokibhasansagar/BDInfoCLI-n
 
 <p>
   <a href="https://github.com/autobrr/mkbrr"><img src="https://github.com/autobrr/mkbrr/blob/main/.github/assets/mkbrr-dark.png?raw=true" alt="mkbrr" height="40px;"></a>&nbsp;&nbsp;
+  <a href="https://github.com/autobrr/qui"><img src="https://github.com/autobrr/qui/blob/develop/documentation/static/img/qui.png?raw=true" alt="qui" height="40px;"></a>&nbsp;&nbsp;
   <a href="https://ffmpeg.org/"><img src="https://i.postimg.cc/xdj3BS7S/FFmpeg-Logo-new-svg.png" alt="FFmpeg" height="40px;"></a>&nbsp;&nbsp;
   <a href="https://mediaarea.net/en/MediaInfo"><img src="https://i.postimg.cc/vTkjXmHh/Media-Info-Logo-svg.png" alt="Mediainfo" height="40px;"></a>&nbsp;&nbsp;
   <a href="https://www.themoviedb.org/"><img src="https://i.postimg.cc/1tpXHx3k/blue-square-2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.png" alt="TMDb" height="40px;"></a>&nbsp;&nbsp;

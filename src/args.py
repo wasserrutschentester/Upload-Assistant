@@ -1,10 +1,13 @@
-# -*- coding: utf-8 -*-
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
 import argparse
-import urllib.parse
-import os
 import datetime
-import sys
+import os
 import re
+import sys
+import urllib.parse
+from collections.abc import Sequence
+from typing import Any, Optional, cast
+
 from src.console import console
 
 
@@ -13,10 +16,11 @@ class ShortHelpFormatter(argparse.HelpFormatter):
     Custom formatter for short help (-h)
     Only displays essential options.
     """
-    def __init__(self, prog):
+
+    def __init__(self, prog: str) -> None:
         super().__init__(prog, max_help_position=40, width=80)
 
-    def format_help(self):
+    def format_help(self) -> str:
         """
         Customize short help output (only show essential arguments).
         """
@@ -28,7 +32,7 @@ Common options:
   -tvmaze, --tvmaze          Specify the TVMaze id to use
   -tvdb, --tvdb              Specify the TVDB id to use
   --queue (queue name)       Process an entire folder (including files/subfolders) in a queue
-  -mf, --manual_frames       Comma-seperated list of frame numbers to use for screenshots
+  -mf, --manual_frames       Comma-separated list of frame numbers to use for screenshots
   -df, --descfile            Path to custom description file
   -serv, --service           Streaming service
   --no-aka                   Remove AKA from title
@@ -37,6 +41,7 @@ Common options:
   -t, --type                 Type (disc, remux, encode, webdl, etc.)
   --source                   Source (Blu-ray, BluRay, DVD, WEBDL, etc.)
   -comps, --comparison       Use comparison images from a folder (input folder path): see -comps_index
+  -webui, --webui            Start the web UI server only (format: host:port, default: 127.0.0.1:5000)
   -debug, --debug            Prints more information, runs everything without actually uploading
 
 Use --help for a full list of options.
@@ -48,7 +53,8 @@ class CustomArgumentParser(argparse.ArgumentParser):
     """
     Custom ArgumentParser to handle short (-h) and long (--help) help messages.
     """
-    def print_help(self, file=None):
+
+    def print_help(self, file: Any = None) -> None:
         """
         Show short help for `-h` and full help for `--help`
         """
@@ -61,23 +67,26 @@ class CustomArgumentParser(argparse.ArgumentParser):
             short_parser.print_help(file)
 
 
-class Args():
+class Args:
     """
     Parse Args
     """
-    def __init__(self, config):
+
+    def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
         pass
 
-    def parse(self, args, meta):
-        input = args
+    def parse(self, argv: Sequence[str], meta: dict[str, Any]) -> tuple[dict[str, Any], CustomArgumentParser, list[str]]:
+        input = list(argv)
         parser = CustomArgumentParser(
             usage="upload.py [path...] [options]",
         )
 
-        parser.add_argument('path', nargs='+', help="Path to file/directory (in single/double quotes is best)")
+        parser.add_argument('path', nargs='*', help="Path to file/directory (in single/double quotes is best)")
         parser.add_argument('--queue', nargs=1, required=False, help="(--queue queue_name) Process an entire folder (files/subfolders) in a queue")
         parser.add_argument('-lq', '--limit-queue', dest='limit_queue', nargs=1, required=False, help="Limit the amount of queue files processed", type=int, default=0)
+        parser.add_argument('-sc', '--site-check', dest='site_check', action='store_true', required=False, help="Just search sites for suitable uploads and create log file, no uploading", default=False)
+        parser.add_argument('-su', '--site-upload', dest='site_upload', nargs=1, required=False, help="Specify a single tracker, and it will process the site searches and upload.", type=str, default=None)
         parser.add_argument('--unit3d', action='store_true', required=False, help="[parse a txt output file from UNIT3D-Upload-Checker]")
         parser.add_argument('-s', '--screens', nargs=1, required=False, help="Number of screenshots", default=int(self.config['DEFAULT']['screens']))
         parser.add_argument('-comps', '--comparison', nargs='+', required=False, help="Use comparison images from a folder (input folder path). See: https://github.com/Audionut/Upload-Assistant/pull/487", default=None)
@@ -114,18 +123,21 @@ class Args():
         parser.add_argument('-ns', '--no-seed', action='store_true', required=False, help="Do not add torrent to the client")
         parser.add_argument('-year', '--year', dest='manual_year', nargs=1, required=False, help="Override the year found", type=int, default=0)
         parser.add_argument('-mc', '--commentary', dest='manual_commentary', action='store_true', required=False, help="Manually indicate whether commentary tracks are included")
+        parser.add_argument('-sfxs', '--sfx-subtitles', dest='sfx_subtitles', action='store_true', required=False, help="Manually indicate whether subtitles with visual enhancements like animations, effects, or backgrounds are included")
         parser.add_argument('-e', '--extras', dest='extras', action='store_true', required=False, help="Indicates that extras are included. Mainly used for Blu-rays discs")
+        parser.add_argument('-sort', '--sorted-filelist', dest='sorted_filelist', action='store_true', required=False, help="Use the largest video file for processing instead of the first video file found")
         parser.add_argument('-ptp', '--ptp', nargs=1, required=False, help="PTP torrent id/permalink", type=str)
         parser.add_argument('-blu', '--blu', nargs=1, required=False, help="BLU torrent id/link", type=str)
         parser.add_argument('-aither', '--aither', nargs=1, required=False, help="Aither torrent id/link", type=str)
         parser.add_argument('-lst', '--lst', nargs=1, required=False, help="LST torrent id/link", type=str)
         parser.add_argument('-oe', '--oe', nargs=1, required=False, help="OE torrent id/link", type=str)
-        parser.add_argument('-tik', '--tik', nargs=1, required=False, help="TIK torrent id/link", type=str)
         parser.add_argument('-hdb', '--hdb', nargs=1, required=False, help="HDB torrent id/link", type=str)
         parser.add_argument('-btn', '--btn', nargs=1, required=False, help="BTN torrent id/link", type=str)
         parser.add_argument('-bhd', '--bhd', nargs=1, required=False, help="BHD torrent_id/link", type=str)
         parser.add_argument('-huno', '--huno', nargs=1, required=False, help="HUNO torrent id/link", type=str)
         parser.add_argument('-ulcx', '--ulcx', nargs=1, required=False, help="ULCX torrent id/link", type=str)
+        parser.add_argument('-req', '--search_requests', action='store_true', required=False, help="Search for matching requests on supported trackers", default=None)
+        parser.add_argument('-sat', '--skip_auto_torrent', action='store_true', required=False, help="Skip automated qbittorrent client torrent searching", default=None)
         parser.add_argument('-onlyID', '--onlyID', action='store_true', required=False, help="Only grab meta ids (tmdb/imdb/etc) from tracker, not description/image links.", default=None)
         parser.add_argument('--foreign', dest='foreign', action='store_true', required=False, help="Set for TIK Foreign category")
         parser.add_argument('--opera', dest='opera', action='store_true', required=False, help="Set for TIK Opera & Musical category")
@@ -133,41 +145,48 @@ class Args():
         parser.add_argument('-disctype', '--disctype', nargs=1, required=False, help="Type of disc for TIK (BD100, BD66, BD50, BD25, NTSC DVD9, NTSC DVD5, PAL DVD9, PAL DVD5, Custom, 3D)", type=str)
         parser.add_argument('--untouched', dest='untouched', action='store_true', required=False, help="Set when a completely untouched disc at TIK")
         parser.add_argument('-manual_dvds', '--manual_dvds', nargs=1, required=False, help="Override the default number of DVD's (eg: use 2xDVD9+DVD5 instead)", type=str, dest='manual_dvds', default="")
-        parser.add_argument('-pb', '--desclink', nargs=1, required=False, help="Custom Description (link to hastebin/pastebin)")
-        parser.add_argument('-df', '--descfile', nargs=1, required=False, help="Custom Description (path to file OR filename in current working directory)")
-        parser.add_argument('-ih', '--imghost', nargs=1, required=False, help="Image Host", choices=['imgbb', 'ptpimg', 'imgbox', 'pixhost', 'lensdump', 'ptscreens', 'onlyimage', 'dalexni', 'zipline'])
+        parser.add_argument('-pb', '--desclink', dest='description_link', nargs=1, required=False, help="Custom Description (link to hastebin/pastebin)")
+        parser.add_argument('-df', '--descfile', dest='description_file', nargs=1, required=False, help="Custom Description (path to file OR filename in current working directory)")
+        parser.add_argument('-menus', '--disc-menus', dest='path_to_menu_screenshots', nargs=1, required=False, help="Raw Disc only (Blu-ray/DVD). Path to the folder containing screenshots of the disc menus. All image files found in the folder will be used. Files should preferably be in PNG format (due to restrictions on some trackers), but other formats can be used (jpg, jpeg, webp)", type=str, default="")
+        parser.add_argument('-ih', '--imghost', nargs=1, required=False, help="Image Host", choices=['imgbb', 'ptpimg', 'imgbox', 'pixhost', 'lensdump', 'ptscreens', 'onlyimage', 'dalexni', 'zipline', 'passtheimage', 'seedpool_cdn', 'utppm'])
         parser.add_argument('-siu', '--skip-imagehost-upload', dest='skip_imghost_upload', action='store_true', required=False, help="Skip Uploading to an image host")
         parser.add_argument('-th', '--torrenthash', nargs=1, required=False, help="Torrent Hash to re-use from your client's session directory")
         parser.add_argument('-nfo', '--nfo', action='store_true', required=False, help="Use .nfo in directory for description")
-        parser.add_argument('-k', '--keywords', nargs=1, required=False, help="Add comma seperated keywords e.g. 'keyword, keyword2, etc'")
+        parser.add_argument('-k', '--keywords', nargs=1, required=False, help="Add comma separated keywords e.g. 'keyword, keyword2, etc'")
         parser.add_argument('-kf', '--keep-folder', action='store_true', required=False, help="Keep the folder containing the single file. Works only when supplying a directory as input. For uploads with poor filenames, like some scene.")
+        parser.add_argument('-knfo', '--keep-nfo', action='store_true', required=False, help="For specific trackers only, allows to keep nfo files. With single files, must be used in conjuction with --keep-folder to find the nfo in the same folder as the file.", dest="keep_nfo")
         parser.add_argument('-reg', '--region', nargs=1, required=False, help="Region for discs")
         parser.add_argument('-a', '--anon', action='store_true', required=False, help="Upload anonymously")
         parser.add_argument('-st', '--stream', action='store_true', required=False, help="Stream Optimized Upload")
         parser.add_argument('-webdv', '--webdv', action='store_true', required=False, help="Contains a Dolby Vision layer converted using dovi_tool (HYBRID)")
-        parser.add_argument('-hc', '--hardcoded-subs', action='store_true', required=False, help="Contains hardcoded subs", dest="hardcoded-subs")
+        parser.add_argument('-hc', '--hardcoded-subs', action='store_true', required=False, help="Contains hardcoded subs", dest="hardcoded_subs")
         parser.add_argument('-pr', '--personalrelease', action='store_true', required=False, help="Personal Release")
         parser.add_argument('-sdc', '--skip-dupe-check', action='store_true', required=False, help="Ignore dupes and upload anyway (Skips dupe check)", dest="dupe")
         parser.add_argument('-sda', '--skip-dupe-asking', action='store_true', required=False, help="Don't prompt about dupes, just treat dupes as actual dupes", dest="ask_dupe")
+        parser.add_argument('-ddc', '--double-dupe-check', action='store_true', required=False, help="May be useful when trying to race. Will run another dupe checking pass on any trackers that previously passed upload check, right before uploading", dest="dupe_again")
         parser.add_argument('-debug', '--debug', action='store_true', required=False, help="Debug Mode, will run through all the motions providing extra info, but will not upload to trackers.")
         parser.add_argument('-ffdebug', '--ffdebug', action='store_true', required=False, help="Will show info from ffmpeg while taking screenshots.")
-        parser.add_argument('-mps', '--max-piece-size', nargs=1, required=False, help="Set max piece size allowed in MiB for default torrent creation (default 128 MiB)", choices=['2', '4', '8', '16', '32', '64', '128'])
+        parser.add_argument('-uptimer', '--upload-timer', action='store_true', required=False, help="Prints the time it takes to upload to each individual site.", dest="upload_timer")
+        parser.add_argument('-mps', '--max-piece-size', nargs=1, required=False, help="Set max piece size allowed in MiB for default torrent creation (default 128 MiB)", choices=['1', '2', '4', '8', '16', '32', '64', '128'])
         parser.add_argument('-nh', '--nohash', action='store_true', required=False, help="Don't hash .torrent")
         parser.add_argument('-rh', '--rehash', action='store_true', required=False, help="DO hash .torrent")
         parser.add_argument('-mkbrr', '--mkbrr', action='store_true', required=False, help="Use mkbrr for torrent hashing")
+        parser.add_argument('-frc', '--force-recheck', action='store_true', required=False, help="(qBitTorrent only with auto torrent searching) Force recheck torrent in client before uploading", dest="force_recheck")
         parser.add_argument('-dr', '--draft', action='store_true', required=False, help="Send to drafts (BHD, LST)")
         parser.add_argument('-mq', '--modq', action='store_true', required=False, help="Send to modQ")
         parser.add_argument('-client', '--client', nargs=1, required=False, help="Use this torrent client instead of default")
         parser.add_argument('-qbt', '--qbit-tag', dest='qbit_tag', nargs=1, required=False, help="Add to qbit with this tag")
         parser.add_argument('-qbc', '--qbit-cat', dest='qbit_cat', nargs=1, required=False, help="Add to qbit with this category")
         parser.add_argument('-rtl', '--rtorrent-label', dest='rtorrent_label', nargs=1, required=False, help="Add to rtorrent with this label")
-        parser.add_argument('-tk', '--trackers', nargs=1, required=False, help="Upload to these trackers, comma seperated (--trackers blu,bhd) including manual")
+        parser.add_argument('-tk', '--trackers', nargs=1, required=False, help="Upload to these trackers, comma separated (--trackers blu,bhd) including manual")
+        parser.add_argument('-rtk', '--trackers-remove', dest='trackers_remove', nargs=1, required=False, help="Remove these trackers when processing default trackers, comma separated (--trackers-remove blu,bhd)")
         parser.add_argument('-tpc', '--trackers-pass', dest='trackers_pass', nargs=1, required=False, help="How many trackers need to pass all checks (dupe/banned group/etc) to actually proceed to uploading", type=int)
         parser.add_argument('-rt', '--randomized', nargs=1, required=False, help="Number of extra, torrents with random infohash", default=0)
         parser.add_argument('-entropy', '--entropy', dest='entropy', nargs=1, required=False, help="Use entropy in created torrents. (32 or 64) bits (ie: -entropy 32). Not supported at all sites, you many need to redownload the torrent", type=int, default=0)
         parser.add_argument('-ua', '--unattended', action='store_true', required=False, help=argparse.SUPPRESS)
         parser.add_argument('-uac', '--unattended_confirm', action='store_true', required=False, help=argparse.SUPPRESS)
         parser.add_argument('-vs', '--vapoursynth', action='store_true', required=False, help="Use vapoursynth for screens (requires vs install)")
+        parser.add_argument('-webui', '--webui', nargs='?', const='127.0.0.1:5000', metavar='HOST:PORT', help="Start the web UI server only (format: host:port, default: 127.0.0.1:5000)")
         parser.add_argument('-dm', '--delete-meta', action='store_true', required=False, dest='delete_meta', help="Delete only meta.json from tmp directory")
         parser.add_argument('-dtmp', '--delete-tmp', action='store_true', required=False, dest='delete_tmp', help="Delete tmp directory for the working file/folder")
         parser.add_argument('-cleanup', '--cleanup', action='store_true', required=False, help="Clean up tmp directory")
@@ -176,44 +195,45 @@ class Args():
         parser.add_argument('-emby', '--emby', action='store_true', required=False, help="Create an Emby-compliant NFO file and optionally symlink the content")
         parser.add_argument('-emby_cat', '--emby_cat', nargs=1, required=False, help="Set the expected category for Emby (e.g., 'movie', 'tv')")
         parser.add_argument('-emby_debug', '--emby_debug', action='store_true', required=False, help="Does debugging stuff for Audionut")
-        args, before_args = parser.parse_known_args(input)
-        args = vars(args)
+        parser.add_argument('-ch', '--channel', nargs=1, required=False, help="SPD only: Channel ID number or tag to upload to (preferably the ID), without '@'. Example: '-ch spd' when using a tag, or '-ch 1' when using an ID.", type=str, dest='spd_channel', default="")
+        parsed_args_ns, before_args = parser.parse_known_args(input)
+        parsed_args: dict[str, Any] = vars(parsed_args_ns)
         # console.print(args)
-        if meta.get('manual_frames') is not None:
-            try:
-                # Join the list into a single string, split by commas, and convert to integers
-                meta['manual_frames'] = [int(time.strip()) for time in meta['manual_frames'].split(',')]
-                # console.print(f"Processed manual_frames: {meta['manual_frames']}")
-            except ValueError:
-                console.print("[red]Invalid format for manual_frames. Please provide a comma-separated list of integers.")
-                console.print(f"Processed manual_frames: {meta['manual_frames']}")
-                sys.exit(1)
-        else:
-            meta['manual_frames'] = None  # Explicitly set it to None if not provided
-        if len(before_args) >= 1 and not os.path.exists(' '.join(args['path'])):
+
+        # Validation: require either path, site_upload, or webui
+        if not parsed_args.get('path') and not parsed_args.get('site_upload') and not parsed_args.get('webui'):
+            console.print("[red]Error: Either a path must be provided, --site-upload must be specified, or --webui must be specified.[/red]")
+            parser.print_help()
+            sys.exit(1)
+
+        # For site upload mode, provide a dummy path if none given
+        if (parsed_args.get('site_upload') or parsed_args.get('webui')) and not parsed_args.get('path'):
+            parsed_args['path'] = ['dummy_path_for_site_upload']
+
+        # manual_frames parsing happens after parsed_args are merged into meta
+        if len(before_args) >= 1 and not os.path.exists(' '.join(parsed_args['path'])):
             for each in before_args:
-                args['path'].append(each)
-                if os.path.exists(' '.join(args['path'])):
+                parsed_args['path'].append(each)
+                if os.path.exists(' '.join(parsed_args['path'])):
                     if any(".mkv" in x for x in before_args):
-                        if ".mkv" in ' '.join(args['path']):
+                        if ".mkv" in ' '.join(parsed_args['path']):
                             break
                     else:
                         break
 
         if meta.get('tmdb_manual') is not None or meta.get('imdb_manual') is not None:
             meta['tmdb_manual'] = meta['tmdb_id'] = meta['tmdb'] = meta['imdb_id'] = meta['imdb'] = None
-        for key in args:
-            value = args.get(key)
+        for key in parsed_args:
+            value = parsed_args[key]
             if value not in (None, []):
                 if isinstance(value, list):
-                    value2 = self.list_to_string(value)
+                    value_list = [str(item) for item in cast(list[Any], value)]
+                    value2 = self.list_to_string(value_list)
                     if key == 'manual_type':
                         meta['manual_type'] = value2.upper().replace('-', '')
                     elif key == 'tag':
                         meta[key] = f"-{value2}"
-                    elif key == 'descfile':
-                        meta[key] = os.path.abspath(value2)
-                    elif key == 'comparison':
+                    elif key == 'description_file' or key == 'comparison':
                         meta[key] = os.path.abspath(value2)
                     elif key == 'screens':
                         meta[key] = int(value2)
@@ -364,42 +384,113 @@ class Args():
                         meta[key] = value2
                 else:
                     meta[key] = value
-            elif key in ("manual_edition"):
-                if isinstance(value, list) and len(value) == 1:
-                    meta[key] = value[0]
+            if key == 'site_upload':
+                if isinstance(value, list):
+                    value_list = [str(item) for item in cast(list[Any], value)]
+                    if len(value_list) == 1:
+                        meta[key] = value_list[0].upper()  # Extract the tracker acronym and uppercase it
+                    elif value_list:
+                        meta[key] = str(value_list).upper()
+                    else:
+                        meta[key] = None
+                elif value is not None:
+                    meta[key] = str(value).upper()
+                else:
+                    meta[key] = None
+            if key in ("manual_edition"):
+                if isinstance(value, list):
+                    value_list = [str(item) for item in cast(list[Any], value)]
+                    if len(value_list) == 1:
+                        meta[key] = value_list[0]
+                    else:
+                        meta[key] = value_list
                 else:
                     meta[key] = value
-            elif key in ("manual_dvds"):
-                meta[key] = value
-            elif key in ("freeleech"):
-                meta[key] = 100
-            elif key in ("tag") and value == []:
+            if key in ("manual_dvds"):
+                if isinstance(value, list):
+                    value_list = [str(item) for item in cast(list[Any], value)]
+                    if len(value_list) == 1:
+                        meta[key] = value_list[0]
+                    elif value_list:
+                        meta[key] = value_list
+                    else:
+                        meta[key] = ""
+                elif value not in (None, [], ""):
+                    meta[key] = value
+                else:
+                    meta[key] = ""
+            if key in ("freeleech"):
+                if isinstance(value, list):
+                    value_list = [str(item) for item in cast(list[Any], value)]
+                    if len(value_list) == 1 and value_list[0] != "":
+                        meta[key] = int(value_list[0])
+                    else:
+                        meta[key] = 0
+                elif value not in (None, [], 0, ""):
+                    meta[key] = int(str(value))
+                else:
+                    meta[key] = 0
+            if key in ["manual_episode_title"] and value == []:
                 meta[key] = ""
-            elif key in ["manual_episode_title"] and value == []:
-                meta[key] = ""
-            elif key in ["manual_episode_title"]:
-                meta[key] = value
-            elif key in ["tvmaze_manual"]:
-                meta[key] = value
-            elif key == 'trackers':
+            if key in ["tvmaze_manual"]:
+                if isinstance(value, list):
+                    value_list = [str(item) for item in cast(list[Any], value)]
+                    if len(value_list) == 1:
+                        meta[key] = value_list[0]
+                    else:
+                        meta[key] = value_list
+                elif value not in (None, []):
+                    meta[key] = value
+            if key == 'trackers':
                 if value:
-                    tracker_value = value
+                    # Extract from list if it's a single-item list (from nargs=1)
+                    if isinstance(value, list):
+                        value_list = cast(list[Any], value)
+                        tracker_value: Any = value_list[0] if len(value_list) == 1 else value_list
+                    else:
+                        tracker_value = value
+
                     if isinstance(tracker_value, str):
                         tracker_value = tracker_value.strip('"\'')
 
-                    if isinstance(tracker_value, str) and ',' in tracker_value:
-                        meta[key] = [t.strip().upper() for t in tracker_value.split(',')]
+                        # Split by comma if present
+                        if ',' in tracker_value:
+                            meta[key] = [t.strip().upper() for t in tracker_value.split(',')]
+                        else:
+                            meta[key] = [tracker_value.strip().upper()]
+                    elif isinstance(tracker_value, list):
+                        # Handle list of strings
+                        expanded: list[str] = []
+                        for t in cast(list[Any], tracker_value):
+                            t_str = str(t)
+                            if ',' in t_str:
+                                expanded.extend([x.strip().upper() for x in t_str.split(',')])
+                            else:
+                                expanded.append(t_str.strip().upper())
+                        meta[key] = expanded
                     else:
-                        meta[key] = [tracker_value.strip().upper()] if isinstance(tracker_value, str) else [tracker_value.upper()]
+                        meta[key] = [str(tracker_value).upper()]
                 else:
                     meta[key] = []
             else:
-                meta[key] = meta.get(key, None)
+                meta[key] = meta.get(key)
             # if key == 'help' and value == True:
                 # parser.print_help()
+
+        manual_frames_value = meta.get('manual_frames')
+        if manual_frames_value is not None:
+            try:
+                frames_str = str(manual_frames_value)
+                meta['manual_frames'] = [int(t.strip()) for t in frames_str.split(',') if t.strip()]
+            except ValueError:
+                console.print("[red]Invalid format for manual_frames. Please provide a comma-separated list of integers.")
+                console.print(f"Processed manual_frames: {manual_frames_value}")
+                sys.exit(1)
+        else:
+            meta['manual_frames'] = None
         return meta, parser, before_args
 
-    def list_to_string(self, list):
+    def list_to_string(self, list: list[str]) -> str:
         if len(list) == 1:
             return str(list[0])
         try:
@@ -408,10 +499,12 @@ class Args():
             result = "None"
         return result
 
-    def parse_tmdb_id(self, id, category):
-        id = str(id).lower().strip()
-        if id.startswith('http'):
-            parsed = urllib.parse.urlparse(id)
+    def parse_tmdb_id(self, id_str: str, category: Optional[str]) -> tuple[str, int]:
+        if category is None:
+            category = ''
+        parsed_id: str = str(id_str).lower().strip()
+        if parsed_id.startswith('http'):
+            parsed = urllib.parse.urlparse(parsed_id)
             path = parsed.path.strip('/')
 
             if '/' in path:
@@ -425,20 +518,17 @@ class Args():
                     elif type_part == 'movie':
                         category = 'MOVIE'
 
-                    id = id_part
+                    parsed_id = id_part
 
-        if id.startswith('tv'):
-            id = id.split('/')[1]
+        if parsed_id.startswith('tv'):
+            parsed_id = parsed_id.split('/')[1]
             category = 'TV'
-        elif id.startswith('movie'):
-            id = id.split('/')[1]
+        elif parsed_id.startswith('movie'):
+            parsed_id = parsed_id.split('/')[1]
             category = 'MOVIE'
         else:
-            id = id
+            parsed_id = parsed_id
 
-        if isinstance(id, str) and id.isdigit():
-            id = int(id)
-        else:
-            id = 0
+        parsed_id_int = int(parsed_id) if parsed_id.isdigit() else 0
 
-        return category, id
+        return category, parsed_id_int

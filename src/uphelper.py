@@ -1,49 +1,307 @@
-import cli_ui
-import os
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
 import json
-from rich.console import Console
-from data.config import config
+import os
+import sys
+from collections.abc import Mapping
+from difflib import SequenceMatcher
+from typing import Any, Callable, Optional, Union, cast
 
-console = Console()
+import aiofiles
+import cli_ui
 
+from cogs.redaction import Redaction
+from src.bdinfo_comparator import compare_bdinfo, has_bdinfo_content
+from src.cleanup import cleanup_manager
+from src.console import console
+from src.trackersetup import tracker_class_map
+
+Meta = dict[str, Any]
+DupeEntry = dict[str, Any]
 
 class UploadHelper:
-    async def dupe_check(self, dupes, meta, tracker_name):
-        if not dupes:
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+        self.default_config = cast(Mapping[str, Any], config.get('DEFAULT', {}))
+        if not isinstance(self.default_config, dict):
+            raise ValueError("'DEFAULT' config section must be a dict")
+        self.tracker_class_map = cast(Mapping[str, Any], tracker_class_map)
+
+    async def dupe_check(self, dupes: list[Union[DupeEntry, str]], meta: Meta, tracker_name: str) -> tuple[bool, Meta]:
+        def _format_dupe(entry: Union[DupeEntry, str]) -> str:
+            if isinstance(entry, dict):
+                name = str(entry.get('name', ''))
+                link = entry.get('link')
+                if isinstance(link, str) and link:
+                    return f"{name} - {link}"
+                return name
+            return str(entry)
+
+        dupes_list: list[Union[DupeEntry, str]] = dupes
+        upload: bool = False
+        meta['were_trumping'] = False
+        if not dupes_list:
             if meta['debug']:
                 console.print(f"[green]No dupes found at[/green] [yellow]{tracker_name}[/yellow]")
-            meta['upload'] = True
-            return meta, False
+            return False,  meta
         else:
+            tracker_class_factory = cast(Callable[..., Any], self.tracker_class_map[tracker_name])
+            tracker_class = tracker_class_factory(config=self.config)
+            try:
+                tracker_rename = await tracker_class.get_name(meta)
+            except Exception:
+                try:
+                    tracker_rename = await tracker_class.edit_name(meta)
+                except Exception:
+                    tracker_rename = None
+            display_name: Optional[str] = None
+            if tracker_rename is not None:
+                if isinstance(tracker_rename, dict) and 'name' in tracker_rename:
+                    tracker_rename_dict = cast(dict[str, Any], tracker_rename)
+                    display_name = str(tracker_rename_dict.get('name', ''))
+                elif isinstance(tracker_rename, str):
+                    display_name = tracker_rename
+
+            # Show naming change before dupe prompts so user knows what the final name will be
+            if display_name is not None and display_name != "" and display_name != meta.get('name', ''):
+                console.print(f"[bold yellow]{tracker_name} applies a naming change for this release: [green]{display_name}[/green][/bold yellow]")
+
+            trumpable_text = None
+            if meta.get('trumpable_id') or (meta.get('season_pack_contains_episode') and meta.get(f'{tracker_name}_matched_episode_ids', [])):
+                trumpable_dupes = [
+                    entry
+                    for entry in dupes_list
+                    if isinstance(entry, dict) and entry.get('trumpable')
+                ]
+                if trumpable_dupes:
+                    trumpable_text = "\n".join(_format_dupe(d) for d in trumpable_dupes)
+                    console.print("[bold red]Trumpable found![/bold red]")
+                elif meta.get('season_pack_contains_episode') and meta.get(f'{tracker_name}_matched_episode_ids', []):
+                    matched_episodes = cast(list[DupeEntry], meta.get(f'{tracker_name}_matched_episode_ids', []))
+                    user_tag = str(meta.get('tag', '')).lstrip('-').lower()  # Remove leading dash for comparison
+
+                    # Try to find a release with matching tag
+                    selected_match = None
+                    tag_matched = False
+                    if user_tag:
+                        for ep in matched_episodes:
+                            ep_name = str(ep.get('name', '')).lower()
+                            # Tag typically appears at end of name like "H.265-ETHEL"
+                            if ep_name.endswith(user_tag) or f"-{user_tag}" in ep_name:
+                                selected_match = ep
+                                tag_matched = True
+                                break
+
+                    # Fall back to first match if no tag match found
+                    if not selected_match:
+                        selected_match = matched_episodes[0]
+
+                    trumpable_text = _format_dupe(selected_match)
+                    console.print("[bold red]Trumpable found based on episode matching![/bold red]")
+
+                    if user_tag and not tag_matched:
+                        console.print(f"[yellow]Note: No release found with matching tag '{meta.get('tag')}'. Selected release may be from a different group.[/yellow]")
+
             if (not meta['unattended'] or (meta['unattended'] and meta.get('unattended_confirm', False))) and not meta.get('ask_dupe', False):
-                dupe_text = "\n".join([d['name'] if isinstance(d, dict) else d for d in dupes])
-                console.print(f"[bold blue]Check if these are actually dupes from {tracker_name}:[/bold blue]")
-                console.print()
-                console.print(f"[bold cyan]{dupe_text}[/bold cyan]")
-                if meta.get('dupe', False) is False:
-                    upload = cli_ui.ask_yes_no(f"Upload to {tracker_name} anyway?", default=False)
-                    meta['we_asked'] = True
-                else:
-                    upload = True
-                    meta['we_asked'] = False
+                dupe_text = "\n".join(_format_dupe(d) for d in dupes_list)
+
+                if trumpable_text and (meta.get('trumpable_id') or (meta.get('season_pack_contains_episode') and meta.get(f'{tracker_name}_matched_episode_ids', []))):
+                    console.print(f"[bold cyan]{trumpable_text}[/bold cyan]")
+                    console.print("[yellow]Please check the trumpable entries above to see if you want to upload[/yellow]")
+                    console.print("[yellow]You will have the option to report the trumpable torrent if you upload.[/yellow]")
+                    if meta.get('dupe', False) is False:
+                        try:
+                            upload = cli_ui.ask_yes_no("Are you trumping this release?", default=False)
+                            if upload:
+                                meta['we_asked'] = True
+                                meta['were_trumping'] = True
+                                if not meta.get(f'{tracker_name}_trumpable_id'):
+                                    meta[f'{tracker_name}_trumpable_id'] = meta.get(f'{tracker_name}_matched_id', None)
+                                if meta.get('filename_match', False) and meta.get('file_count_match', False):
+                                    meta['trump_reason'] = 'exact_match'
+                                else:
+                                    meta['trump_reason'] = 'trumpable_release'
+                                if meta['debug']:
+                                    console.print(f"[bold green]Trump reason: {meta['trump_reason']} on {tracker_name}[/bold green]")
+                            else:
+                                # For season packs: individual episodes are only in dupes for trumping purposes.
+                                # If user declines to trump, filter them out so they aren't shown as "potential dupes"
+                                # (they wouldn't match season/episode anyway).
+                                if meta.get('tv_pack') and meta.get('season_pack_contains_episode') and meta.get(f'{tracker_name}_matched_episode_ids', []):
+                                    matched_ids = {ep.get('id') for ep in meta.get(f'{tracker_name}_matched_episode_ids', []) if ep.get('id')}
+                                    dupes_list = [
+                                        d for d in dupes_list
+                                        if not (isinstance(d, dict) and d.get('id') in matched_ids)
+                                    ]
+                                    # Clear tracker-specific matched_episode_ids since we're not trumping
+                                    meta[f'{tracker_name}_matched_episode_ids'] = []
+                        except EOFError:
+                            console.print("\n[red]Exiting on user request (Ctrl+C)[/red]")
+                            await cleanup_manager.cleanup()
+                            cleanup_manager.reset_terminal()
+                            sys.exit(1)
+
+                if not meta.get('were_trumping', False):
+                    if meta.get('filename_match', False) and meta.get('file_count_match', False):
+                        console.print(f'[bold red]Exact match found! - {meta["filename_match"]}[/bold red]')
+                        try:
+                            if tracker_name in ["AITHER", "LST"]:
+                                console.print(f"[yellow]{tracker_name} supports automatic trumping of exact matches, if the file is allowed to be trumped.[/yellow]")
+                                upload = cli_ui.ask_yes_no("Are you trumping this exact match?", default=False)
+                                if upload:
+                                    meta['we_asked'] = True
+                                    meta['were_trumping'] = True
+                                    meta['trump_reason'] = 'exact_match'
+                                    if not meta.get(f'{tracker_name}_trumpable_id'):
+                                        meta[f'{tracker_name}_trumpable_id'] = meta.get(f'{tracker_name}_matched_id', None)
+                            else:
+                                upload = cli_ui.ask_yes_no(f"Upload to {tracker_name} anyway?", default=False)
+                                meta['we_asked'] = True
+                        except EOFError:
+                            console.print("\n[red]Exiting on user request (Ctrl+C)[/red]")
+                            await cleanup_manager.cleanup()
+                            cleanup_manager.reset_terminal()
+                            sys.exit(1)
+                    elif dupes_list:
+                        # Rebuild dupe_text in case dupes was filtered after trump decline
+                        dupe_text = "\n".join(_format_dupe(d) for d in dupes_list)
+                        if meta.get('season_pack_exists', False):
+                            # Display only the matched season pack info from dupe_checking
+                            season_pack_name = meta.get('season_pack_name', '')
+                            season_pack_link = meta.get('season_pack_link')
+                            season_pack_text = f"{season_pack_name} - {season_pack_link}" if season_pack_link else season_pack_name
+                            console.print(f"[yellow]Note: A season pack exists on {tracker_name}[/yellow]")
+                            console.print("[yellow]Ensure your upload is not part of that season pack, or is otherwise allowed.[/yellow]")
+                            console.print()
+                            console.print(f"[bold cyan]{season_pack_text}[/bold cyan]")
+                        else:
+                            console.print(f"[bold blue]Check if these are actually dupes from {tracker_name}:[/bold blue]")
+                            console.print()
+                            console.print(f"[bold cyan]{dupe_text}[/bold cyan]")
+                        if meta.get('dupe', False) is False:
+                            try:
+                                if meta.get('is_disc') == "BDMV":
+                                    self.ask_bdinfo_comparison(meta, dupes_list, tracker_name)
+                                upload = cli_ui.ask_yes_no(f"Upload to {tracker_name} anyway?", default=False)
+                                meta['we_asked'] = True
+                            except EOFError:
+                                console.print("\n[red]Exiting on user request (Ctrl+C)[/red]")
+                                await cleanup_manager.cleanup()
+                                cleanup_manager.reset_terminal()
+                                sys.exit(1)
+                        else:
+                            upload = True
+                    else:
+                        # dupes list was emptied after filtering (e.g., season pack declined trump, no other dupes)
+                        upload = True
+
             else:
-                if meta.get('dupe', False) is False:
-                    upload = False
-                    meta['we_asked'] = True
-                else:
-                    upload = True
+                upload = meta.get('dupe', False) is not False
+
+            display_name = display_name if display_name is not None else str(meta.get('name', ''))
+            display_name = str(display_name)
+
+            if tracker_name in ["BHD"]:
+                if meta['debug']:
+                    console.print("[yellow]BHD cross seeding check[/yellow]")
+                tracker_download_link = meta.get(f'{tracker_name}_matched_download')
+                # Ensure display_name is a string before using 'in' operator
+                if display_name:
+                    edition = meta.get('edition', '')
+                    region = meta.get('region', '')
+                    if edition and edition in display_name:
+                        display_name = display_name.replace(f"{edition} ", "")
+                    if region and region in display_name:
+                        display_name = display_name.replace(f"{region} ", "")
+                for d in dupes_list:
+                    if isinstance(d, dict):
+                        entry_name = str(d.get('name', '')).lower()
+                        similarity = SequenceMatcher(None, entry_name, display_name.lower().strip()).ratio()
+                        if similarity > 0.9 and meta.get('size_match', False) and tracker_download_link:
+                            meta[f'{tracker_name}_cross_seed'] = tracker_download_link
+                            if meta['debug']:
+                                console.print(f'[bold red]Cross-seed link saved for {tracker_name}: {Redaction.redact_private_info(tracker_download_link)}.[/bold red]')
+                            break
+
+            elif meta.get('filename_match', False) and meta.get('file_count_match', False):
+                if meta['debug']:
+                    console.print(f"[yellow]{tracker_name} filename and file count cross seeding check[/yellow]")
+                tracker_download_link = meta.get(f'{tracker_name}_matched_download')
+                for d in dupes_list:
+                    if isinstance(d, dict) and tracker_download_link:
+                        meta[f'{tracker_name}_cross_seed'] = tracker_download_link
+                        if meta['debug']:
+                            console.print(f'[bold red]Cross-seed link saved for {tracker_name}: {Redaction.redact_private_info(tracker_download_link)}.[/bold red]')
+                        break
+
+            elif meta.get('size_match', False):
+                if meta['debug']:
+                    console.print(f"[yellow]{tracker_name} size cross seeding check[/yellow]")
+                tracker_download_link = meta.get(f'{tracker_name}_matched_download')
+                for d in dupes_list:
+                    if isinstance(d, dict):
+                        entry_name = str(d.get('name', '')).lower()
+                        similarity = SequenceMatcher(None, entry_name, display_name.lower().strip()).ratio()
+                        if meta['debug']:
+                            console.print(f"[debug] Comparing sizes with similarity {similarity:.4f}")
+                        if similarity > 0.9 and tracker_download_link:
+                            meta[f'{tracker_name}_cross_seed'] = tracker_download_link
+                            if meta['debug']:
+                                console.print(f'[bold red]Cross-seed link saved for {tracker_name}: {Redaction.redact_private_info(tracker_download_link)}.[/bold red]')
+                            break
 
             if upload is False:
-                return meta, True
+                return True, meta
             else:
-                for each in dupes:
-                    each_name = each['name'] if isinstance(each, dict) else each
+                for each in dupes_list:
+                    each_name = str(each.get('name')) if isinstance(each, dict) else str(each)
                     if each_name == meta['name']:
                         meta['name'] = f"{meta['name']} DUPE?"
 
-                return meta, False
+                return False, meta
 
-    async def get_confirmation(self, meta):
+    def ask_bdinfo_comparison(self, meta: Meta, dupes: list[Union[DupeEntry, str]], tracker_name: str) -> None:
+        """
+        Check if any duplicate has BDInfo content and ask the user
+        if they want to perform a comparison.
+        """
+        possible = any(
+            isinstance(entry, dict) and has_bdinfo_content(entry)
+            for entry in dupes
+        )
+
+        if not possible:
+            return
+
+        question = (
+            "\033[1;35mFound BDInfo content in potential duplicates."
+            "\033[0m Perform a comparison?"
+        )
+        if cli_ui.ask_yes_no(question, default=True):
+            warnings: list[str] = []
+            results: list[str] = []
+
+            for entry in dupes:
+                if not isinstance(entry, dict):
+                    continue
+
+                warning_message, results_message = compare_bdinfo(meta, entry, tracker_name)
+
+                if warning_message:
+                    warnings.append(warning_message)
+                if results_message:
+                    results.append(results_message)
+
+            if warnings:
+                console.print()
+                console.print("\n\n".join(warnings), soft_wrap=True)
+
+            if results:
+                console.print()
+                console.print("\n".join(results), soft_wrap=True)
+                console.print()
+
+    async def get_confirmation(self, meta: Meta) -> bool:
+        confirm: bool = False
         if meta['debug'] is True:
             console.print("[bold red]DEBUG: True - Will not actually upload!")
             console.print(f"Prep material saved to {meta['base_dir']}/tmp/{meta['uuid']}")
@@ -94,9 +352,18 @@ class UploadHelper:
         if not meta.get('emby', False):
             if int(meta.get('freeleech', 0)) != 0:
                 console.print(f"[bold]Freeleech:[/bold] {meta['freeleech']}")
-            tag = "" if meta['tag'] == "" else f" / {meta['tag'][1:]}"
-            res = meta['source'] if meta['is_disc'] == "DVD" else meta['resolution']
-            console.print(f"{res} / {meta['type']}{tag}")
+
+            info_parts: list[str] = []
+            info_parts.append(str(meta['source'] if meta['is_disc'] == 'DVD' else meta['resolution']))
+            info_parts.append(str(meta['type']))
+            if meta.get('tag', ''):
+                info_parts.append(str(meta['tag'])[1:])
+            if meta.get('region', ''):
+                info_parts.append(str(meta['region']))
+            if meta.get('distributor', ''):
+                info_parts.append(str(meta['distributor']))
+            console.print(' / '.join(info_parts))
+
             if meta.get('personalrelease', False) is True:
                 console.print("[bold green]Personal Release![/bold green]")
             console.print()
@@ -108,7 +375,7 @@ class UploadHelper:
         else:
             if not meta.get('emby', False):
                 await self.get_missing(meta)
-                ring_the_bell = "\a" if config['DEFAULT'].get("sfx_on_prompt", True) is True else ""
+                ring_the_bell = "\a" if bool(self.default_config.get("sfx_on_prompt", True)) else ""
                 if ring_the_bell:
                     console.print(ring_the_bell)
 
@@ -116,7 +383,6 @@ class UploadHelper:
                 meta['keep_folder'] = False
 
             if meta.get('keep_folder') and meta['isdir']:
-                console.print("[bold yellow]Uploading with --keep-folder[/bold yellow]")
                 kf_confirm = console.input("[bold yellow]You specified --keep-folder. Uploading in folders might not be allowed.[/bold yellow] [green]Proceed? y/N: [/green]").strip().lower()
                 if kf_confirm != 'y':
                     console.print("[bold red]Aborting...[/bold red]")
@@ -156,19 +422,19 @@ class UploadHelper:
                 os.makedirs(nfo_dir, exist_ok=True)
                 json_file_path = os.path.join(nfo_dir, "db_check.json")
 
-                def imdb_url(imdb_id):
+                def imdb_url(imdb_id: Any) -> Optional[str]:
                     return f"https://www.imdb.com/title/tt{str(imdb_id).zfill(7)}" if imdb_id and str(imdb_id).isdigit() else None
 
-                def tmdb_url(tmdb_id, category):
+                def tmdb_url(tmdb_id: Any, category: Any) -> Optional[str]:
                     return f"https://www.themoviedb.org/{str(category).lower()}/{tmdb_id}" if tmdb_id and category else None
 
-                def tvdb_url(tvdb_id):
+                def tvdb_url(tvdb_id: Any) -> Optional[str]:
                     return f"https://www.thetvdb.com/?id={tvdb_id}&tab=series" if tvdb_id else None
 
-                def tvmaze_url(tvmaze_id):
+                def tvmaze_url(tvmaze_id: Any) -> Optional[str]:
                     return f"https://www.tvmaze.com/shows/{tvmaze_id}" if tvmaze_id else None
 
-                def mal_url(mal_id):
+                def mal_url(mal_id: Any) -> Optional[str]:
                     return f"https://myanimelist.net/anime/{mal_id}" if mal_id else None
 
                 db_check_entry = {
@@ -203,26 +469,26 @@ class UploadHelper:
                 }
 
                 # Append to JSON file (as a list of entries)
+                db_data_list: list[dict[str, Any]] = []
                 if os.path.exists(json_file_path):
-                    with open(json_file_path, 'r', encoding='utf-8') as f:
+                    async with aiofiles.open(json_file_path, encoding='utf-8') as f:
                         try:
-                            db_data = json.load(f)
-                            if not isinstance(db_data, list):
-                                db_data = []
+                            file_contents = await f.read()
+                            if file_contents:
+                                parsed_data = json.loads(file_contents)
+                                if isinstance(parsed_data, list):
+                                    db_data_list = cast(list[dict[str, Any]], parsed_data)
                         except Exception:
-                            db_data = []
-                else:
-                    db_data = []
+                            db_data_list = []
+                db_data_list.append(db_check_entry)
 
-                db_data.append(db_check_entry)
-
-                with open(json_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(db_data, f, indent=2, ensure_ascii=False)
+                async with aiofiles.open(json_file_path, 'w', encoding='utf-8') as f:
+                    await f.write(json.dumps(db_data_list, indent=2, ensure_ascii=False))
                 return True
 
         return confirm
 
-    async def get_missing(self, meta):
+    async def get_missing(self, meta: Meta) -> None:
         info_notes = {
             'edition': 'Special Edition/Release',
             'description': "Please include Remux/Encode Notes if possible",
@@ -231,13 +497,19 @@ class UploadHelper:
             'imdb': 'IMDb ID (tt1234567)',
             'distributor': "Disc Distributor e.g.(BFI, Criterion)"
         }
-        missing = []
         if meta.get('imdb_id', 0) == 0:
             meta['imdb_id'] = 0
-            meta['potential_missing'].append('imdb_id')
-        for each in meta['potential_missing']:
-            if str(meta.get(each, '')).strip() in ["", "None", "0"]:
-                missing.append(f"--{each} | {info_notes.get(each, '')}")
+            potential_missing = cast(list[str], meta.get('potential_missing', []))
+            if 'imdb_id' not in potential_missing:
+                potential_missing.append('imdb_id')
+                meta['potential_missing'] = potential_missing
+        else:
+            potential_missing = cast(list[str], meta.get('potential_missing', []))
+        missing = [
+            f"--{each} | {info_notes.get(each, '')}"
+            for each in potential_missing
+            if str(meta.get(each, '')).strip() in ["", "None", "0"]
+        ]
         if missing:
             console.print("[bold yellow]Potentially missing information:[/bold yellow]")
             for each in missing:

@@ -1,55 +1,113 @@
-# -*- coding: utf-8 -*-
-# import discord
-import asyncio
-import platform
-import os
-import httpx
-import glob
-import requests
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
+import re
+from typing import Any, Optional, cast
+
 import cli_ui
-from src.trackers.COMMON import COMMON
+
 from src.console import console
+from src.trackers.COMMON import COMMON
+from src.trackers.UNIT3D import UNIT3D
+
+Meta = dict[str, Any]
+Config = dict[str, Any]
 
 
-class OTW():
-    """
-    Edit for Tracker:
-        Edit BASE.torrent with announce and source
-        Check for duplicates
-        Set type/category IDs
-        Upload
-    """
-
-    def __init__(self, config):
-        self.config = config
+class OTW(UNIT3D):
+    def __init__(self, config: Config) -> None:
+        super().__init__(config, tracker_name='OTW')
+        self.config: Config = config
+        self.common = COMMON(config)
         self.tracker = 'OTW'
-        self.source_flag = 'OTW'
-        self.upload_url = 'https://oldtoons.world/api/torrents/upload'
-        self.search_url = 'https://oldtoons.world/api/torrents/filter'
-        self.torrent_url = 'https://oldtoons.world/torrents/'
-        self.id_url = 'https://oldtoons.world/api/torrents/'
-        self.signature = "\n[center][url=https://github.com/Audionut/Upload-Assistant]Created by Audionut's Upload Assistant[/url][/center]"
+        self.base_url = 'https://oldtoons.world'
+        self.id_url = f'{self.base_url}/api/torrents/'
+        self.upload_url = f'{self.base_url}/api/torrents/upload'
+        self.search_url = f'{self.base_url}/api/torrents/filter'
+        self.requests_url = f'{self.base_url}/api/requests/filter'
+        self.torrent_url = f'{self.base_url}/torrents/'
         self.banned_groups = [
-            '[Oj]', '3LTON', '4yEo', 'ADE', 'AFG', 'AniHLS', 'AnimeRG', 'AniURL', 'AROMA', 'aXXo', 'CM8', 'CrEwSaDe', 'd3g', 'DeadFish', 'DNL', 'ELiTE', 'eSc', 'FaNGDiNG0', 'FGT', 'Flights',
-            'FRDS', 'FUM', 'GalaxyRG', 'HAiKU', 'HD2DVD', 'HDS', 'HDTime', 'Hi10', 'ION10', 'iPlanet', 'JIVE', 'KiNGDOM', 'Lama', 'Leffe', 'LOAD', 'mHD', 'NhaNc3', 'nHD', 'NOIVTC',
-            'nSD', 'PiRaTeS', 'PRODJi', 'RAPiDCOWS', 'RARBG', 'RDN', 'REsuRRecTioN', 'RMTeam', 'SANTi', 'SicFoI', 'SPASM', 'STUTTERSHIT', 'Telly', 'TM',
-            'UPiNSMOKE', 'WAF', 'xRed', 'XS', 'YELLO', 'YIFY', 'YTS', 'ZKBL', 'ZmN', '4f8c4100292', 'Azkars', 'Sync0rdi',
-            ['EVO', 'Raw Content Only'], ['TERMiNAL', 'Raw Content Only'], ['ViSION', 'Note the capitalization and characters used'], ['CMRG', 'Raw Content Only']
+            '[Oj]', '3LTON', '4yEo', 'ADE', 'AFG', 'AniHLS', 'AnimeRG', 'AniURL',
+            'AROMA', 'aXXo', 'CM8', 'CrEwSaDe', 'DeadFish', 'DNL', 'ELiTE',
+            'eSc', 'FaNGDiNG0', 'FGT', 'Flights', 'FRDS', 'FUM', 'GalaxyRG', 'HAiKU',
+            'HD2DVD', 'HDS', 'HDTime', 'Hi10', 'INFINITY', 'ION10', 'iPlanet', 'JIVE', 'KiNGDOM',
+            'LAMA', 'Leffe', 'LOAD', 'mHD', 'NhaNc3', 'nHD', 'NOIVTC', 'nSD', 'PiRaTeS',
+            'PRODJi', 'RAPiDCOWS', 'RARBG', 'RDN', 'REsuRRecTioN', 'RMTeam', 'SANTi',
+            'SicFoI', 'SPASM', 'STUTTERSHIT', 'Telly', 'TM', 'UPiNSMOKE', 'WAF', 'xRed',
+            'XS', 'YELLO', 'YIFY', 'YTS', 'ZKBL', 'ZmN', '4f8c4100292', 'Azkars', 'Sync0rdi'
         ]
         pass
 
-    async def get_cat_id(self, category_name):
-        category_id = {
-            'MOVIE': '1',
-            'TV': '2',
-        }.get(category_name, '0')
-        return category_id
+    async def get_additional_checks(self, meta: Meta) -> bool:
+        should_continue = True
+        combined_genres_value = meta.get('combined_genres', [])
+        # Normalize combined_genres to a list of individual genre strings.
+        if isinstance(combined_genres_value, list):
+            combined_genres = cast(list[str], combined_genres_value)
+        else:
+            # Split comma-separated strings and strip whitespace
+            combined_genres = [g.strip() for g in str(combined_genres_value).split(',') if g.strip()]
 
-    async def get_type_id(self, type, meta):
-        if meta.get('is_disc') == "BDMV":
-            return '1'
-        elif meta.get('is_disc') and meta.get('is_disc') != "BDMV":
-            return '7'
+        if not any(genre in combined_genres for genre in ['Animation', 'Family']):
+            if not meta['unattended'] or (meta['unattended'] and meta.get('unattended_confirm', False)):
+                console.print('[bold red]Genre does not match Animation or Family for OTW.')
+                if cli_ui.ask_yes_no("Do you want to upload anyway?", default=False):
+                    pass
+                else:
+                    return False
+            else:
+                return False
+
+        keywords_value = meta.get('keywords', '')
+        keywords = ', '.join(cast(list[str], keywords_value)) if isinstance(keywords_value, list) else str(keywords_value)
+        combined_genres_text = ', '.join(combined_genres)
+        genres = f"{keywords} {combined_genres_text}"
+        adult_keywords = ['xxx', 'erotic', 'porn', 'adult', 'orgy', 'hentai', 'adult animation', 'softcore']
+        if any(re.search(rf'(^|,\s*){re.escape(keyword)}(\s*,|$)', genres, re.IGNORECASE) for keyword in adult_keywords):
+            if not meta['unattended'] or (meta['unattended'] and meta.get('unattended_confirm', False)):
+                console.print('[bold red]Adult animation not allowed at OTW.')
+                if cli_ui.ask_yes_no("Do you want to upload anyway?", default=False):
+                    pass
+                else:
+                    return False
+            else:
+                return False
+
+        game_show_keywords = ['reality', 'game show', 'game-show', 'reality tv', 'reality television']
+        if any(re.search(rf'(^|,\s*){re.escape(keyword)}(\s*,|$)', genres, re.IGNORECASE) for keyword in game_show_keywords):
+            if not meta['unattended'] or (meta['unattended'] and meta.get('unattended_confirm', False)):
+                console.print('[bold red]Reality / Game Show content not allowed at OTW.')
+                if cli_ui.ask_yes_no("Do you want to upload anyway?", default=False):
+                    pass
+                else:
+                    return False
+            else:
+                return False
+
+        if meta['type'] not in ['WEBDL'] and not meta['is_disc'] and meta.get('tag', "") in ['CMRG', 'EVO', 'TERMiNAL', 'ViSION']:
+            if not meta['unattended'] or (meta['unattended'] and meta.get('unattended_confirm', False)):
+                console.print(f'[bold red]Group {meta["tag"]} is only allowed for raw type content at OTW[/bold red]')
+                if cli_ui.ask_yes_no("Do you want to upload anyway?", default=False):
+                    pass
+                else:
+                    return False
+            else:
+                return False
+
+        return should_continue
+
+    async def get_type_id(
+        self,
+        meta: Meta,
+        type: Optional[str] = None,
+        reverse: bool = False,
+        mapping_only: bool = False
+    ) -> dict[str, str]:
+        meta_type = str(meta.get('type', ''))
+        if meta.get('is_disc') == 'BDMV':
+            return {'type_id': '1'}
+        elif meta.get('is_disc') and meta.get('is_disc') != 'BDMV':
+            return {'type_id': '7'}
+        if meta_type == "DVDRIP":
+            return {'type_id': '8'}
         type_id = {
             'DISC': '1',
             'REMUX': '2',
@@ -57,214 +115,58 @@ class OTW():
             'WEBRIP': '5',
             'HDTV': '6',
             'ENCODE': '3'
-        }.get(type, '0')
-        return type_id
+        }
+        if mapping_only:
+            return type_id
+        elif reverse:
+            return {v: k for k, v in type_id.items()}
+        type_value = str(type) if type is not None else meta_type
+        return {'type_id': type_id.get(type_value, '0')}
 
-    async def get_res_id(self, resolution):
-        resolution_id = {
-            '8640p': '10',
-            '4320p': '1',
-            '2160p': '2',
-            '1440p': '3',
-            '1080p': '3',
-            '1080i': '4',
-            '720p': '5',
-            '576p': '6',
-            '576i': '7',
-            '480p': '8',
-            '480i': '9'
-        }.get(resolution, '10')
-        return resolution_id
-
-    async def edit_name(self, meta):
-        otw_name = meta['name']
-        source = meta['source']
-        resolution = meta['resolution']
-        aka = meta.get('aka', '')
-        type = meta['type']
+    async def get_name(self, meta: Meta) -> dict[str, str]:
+        otw_name = str(meta.get('name', ''))
+        source = str(meta.get('source', ''))
+        resolution = str(meta.get('resolution', ''))
+        aka = str(meta.get('aka', ''))
+        type = str(meta.get('type', ''))
+        video_codec = str(meta.get('video_codec', ''))
         if aka:
-            otw_name = otw_name.replace(meta["aka"], '')
-        if meta['is_disc'] == "DVD":
-            otw_name = otw_name.replace(source, f"{source} {resolution}")
-        if meta['is_disc'] == "DVD" or type == "REMUX":
-            otw_name = otw_name.replace(meta['audio'], f"{meta.get('video_codec', '')} {meta['audio']}", 1)
-        elif meta['is_disc'] == "DVD" or (type == "REMUX" and source in ("PAL DVD", "NTSC DVD", "DVD")):
-            otw_name = otw_name.replace((meta['source']), f"{resolution} {meta['source']}", 1)
-        if meta['category'] == "TV":
-            years = []
+            otw_name = otw_name.replace(f"{aka} ", '')
+        is_disc = str(meta.get('is_disc', ''))
+        audio = str(meta.get('audio', ''))
+        if is_disc == "DVD" or (type == "REMUX" and source in ("PAL DVD", "NTSC DVD", "DVD")):
+            otw_name = otw_name.replace(source, f"{resolution} {source}", 1)
+            otw_name = otw_name.replace(audio, f"{video_codec} {audio}", 1)
+        if str(meta.get('category', '')) == "TV":
+            years: list[int] = []
 
             tmdb_year = meta.get('year')
             if tmdb_year and str(tmdb_year).isdigit():
-                years.append(int(tmdb_year))
-
-            imdb_year = meta.get('imdb_info', {}).get('year')
-            if imdb_year and str(imdb_year).isdigit():
-                years.append(int(imdb_year))
-
-            series_year = meta.get('tvdb_episode_data', {}).get('series_year')
-            if series_year and str(series_year).isdigit():
-                years.append(int(series_year))
-            # Use the oldest year if any found, else empty string
-            year = str(min(years)) if years else ""
-            if not meta.get('no_year', False) and not meta.get('search_year', ''):
-                otw_name = otw_name.replace(meta['title'], f"{meta['title']} {year}", 1)
-
-        return otw_name
-
-    async def upload(self, meta, disctype):
-        common = COMMON(config=self.config)
-        otw_name = await self.edit_name(meta)
-        await common.edit_torrent(meta, self.tracker, self.source_flag)
-        cat_id = await self.get_cat_id(meta['category'])
-        modq = await self.get_flag(meta, 'modq')
-        type_id = await self.get_type_id(meta['type'], meta)
-        resolution_id = await self.get_res_id(meta['resolution'])
-        await common.unit3d_edit_desc(meta, self.tracker, self.signature)
-        region_id = await common.unit3d_region_ids(meta.get('region'))
-        distributor_id = await common.unit3d_distributor_ids(meta.get('distributor'))
-        if meta['anon'] == 0 and not self.config['TRACKERS'][self.tracker].get('anon', False):
-            anon = 0
-        else:
-            anon = 1
-
-        if meta['bdinfo'] is not None:
-            mi_dump = None
-            bd_dump = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/BD_SUMMARY_00.txt", 'r', encoding='utf-8').read()
-        else:
-            mi_dump = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/MEDIAINFO.txt", 'r', encoding='utf-8').read()
-            bd_dump = None
-        desc = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}]DESCRIPTION.txt", 'r', encoding='utf-8').read()
-        open_torrent = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}].torrent", 'rb')
-        files = {'torrent': open_torrent}
-        base_dir = meta['base_dir']
-        uuid = meta['uuid']
-        specified_dir_path = os.path.join(base_dir, "tmp", uuid, "*.nfo")
-        nfo_files = glob.glob(specified_dir_path)
-        nfo_file = None
-        if nfo_files:
-            nfo_file = open(nfo_files[0], 'rb')
-        if nfo_file:
-            files['nfo'] = ("nfo_file.nfo", nfo_file, "text/plain")
-        data = {
-            'name': otw_name,
-            'description': desc,
-            'mediainfo': mi_dump,
-            'bdinfo': bd_dump,
-            'category_id': cat_id,
-            'type_id': type_id,
-            'resolution_id': resolution_id,
-            'tmdb': meta['tmdb'],
-            'imdb': meta['imdb'],
-            'tvdb': meta['tvdb_id'],
-            'mal': meta['mal_id'],
-            'igdb': 0,
-            'anonymous': anon,
-            'stream': meta['stream'],
-            'sd': meta['sd'],
-            'keywords': meta['keywords'],
-            'personal_release': int(meta.get('personalrelease', False)),
-            'internal': 0,
-            'featured': 0,
-            'free': 0,
-            'doubleup': 0,
-            'mod_queue_opt_in': modq,
-            'sticky': 0,
-        }
-        # Internal
-        if self.config['TRACKERS'][self.tracker].get('internal', False) is True:
-            if meta['tag'] != "" and (meta['tag'][1:] in self.config['TRACKERS'][self.tracker].get('internal_groups', [])):
-                data['internal'] = 1
-
-        if region_id != 0:
-            data['region_id'] = region_id
-        if distributor_id != 0:
-            data['distributor_id'] = distributor_id
-        if meta.get('category') == "TV":
-            data['season_number'] = meta.get('season_int', '0')
-            data['episode_number'] = meta.get('episode_int', '0')
-        headers = {
-            'User-Agent': f'Upload Assistant/2.2 ({platform.system()} {platform.release()})'
-        }
-        params = {
-            'api_token': self.config['TRACKERS'][self.tracker]['api_key'].strip()
-        }
-
-        if meta['debug'] is False:
-            response = requests.post(url=self.upload_url, files=files, data=data, headers=headers, params=params)
-            try:
-                meta['tracker_status'][self.tracker]['status_message'] = response.json()
-                # adding torrent link to comment of torrent file
-                t_id = response.json()['data'].split(".")[1].split("/")[3]
-                meta['tracker_status'][self.tracker]['torrent_id'] = t_id
-                await common.add_tracker_torrent(meta, self.tracker, self.source_flag, self.config['TRACKERS'][self.tracker].get('announce_url'), "https://oldtoons.world/torrents/" + t_id)
-            except Exception:
-                console.print("It may have uploaded, go check")
-                return
-        else:
-            console.print("[cyan]Request Data:")
-            console.print(data)
-            meta['tracker_status'][self.tracker]['status_message'] = "Debug mode enabled, not uploading."
-        open_torrent.close()
-
-    async def get_flag(self, meta, flag_name):
-        config_flag = self.config['TRACKERS'][self.tracker].get(flag_name)
-        if config_flag is not None:
-            return 1 if config_flag else 0
-
-        return 1 if meta.get(flag_name, False) else 0
-
-    async def search_existing(self, meta, disctype):
-        if not any(genre in meta['genres'] for genre in ['Animation', 'Family']):
-            if not meta['unattended'] or (meta['unattended'] and meta.get('unattended_confirm', False)):
-                console.print('[bold red]Genre does not match Animation or Family for OTW.')
-                if cli_ui.ask_yes_no("Do you want to upload anyway?", default=False):
-                    pass
-                else:
-                    meta['skipping'] = "OTW"
-                    return
+                year = str(tmdb_year)
             else:
-                meta['skipping'] = "OTW"
-                return
-        disallowed_keywords = {'XXX', 'Erotic', 'Porn', 'Hentai', 'Adult Animation', 'Orgy', 'softcore'}
-        if any(keyword.lower() in disallowed_keywords for keyword in map(str.lower, meta['keywords'])):
-            if not meta['unattended']:
-                console.print('[bold red]Adult animation not allowed at OTW.')
-            meta['skipping'] = "OTW"
-            return []
-        if meta['sd'] and 'BluRay' in meta['source']:
-            if not meta['unattended']:
-                console.print("[bold red]SD content from HD source not allowed")
-            meta['skipping'] = "OTW"
-            return []
-        dupes = []
-        params = {
-            'api_token': self.config['TRACKERS'][self.tracker]['api_key'].strip(),
-            'tmdbId': meta['tmdb'],
-            'categories[]': await self.get_cat_id(meta['category']),
-            'types[]': await self.get_type_id(meta['type'], meta),
-            'resolutions[]': await self.get_res_id(meta['resolution']),
-            'name': ""
-        }
-        if meta['category'] == 'TV':
-            params['name'] = params['name'] + f" {meta.get('season', '')}"
-        if meta.get('edition', "") != "":
-            params['name'] = params['name'] + f" {meta['edition']}"
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(url=self.search_url, params=params)
-                if response.status_code == 200:
-                    data = response.json()
-                    for each in data['data']:
-                        result = [each][0]['attributes']['name']
-                        dupes.append(result)
-                else:
-                    console.print(f"[bold red]Failed to search torrents. HTTP Status: {response.status_code}")
-        except httpx.TimeoutException:
-            console.print("[bold red]Request timed out after 5 seconds")
-        except httpx.RequestError as e:
-            console.print(f"[bold red]Unable to search for existing torrents: {e}")
-        except Exception as e:
-            console.print(f"[bold red]Unexpected error: {e}")
-            await asyncio.sleep(5)
+                if tmdb_year and str(tmdb_year).isdigit():
+                    years.append(int(tmdb_year))
 
-        return dupes
+                imdb_info = cast(dict[str, Any], meta.get('imdb_info', {}))
+                imdb_year = imdb_info.get('year')
+                if imdb_year and str(imdb_year).isdigit():
+                    years.append(int(imdb_year))
+
+                tvdb_episode_data = cast(dict[str, Any], meta.get('tvdb_episode_data', {}))
+                series_year = tvdb_episode_data.get('series_year')
+                if series_year and str(series_year).isdigit():
+                    years.append(int(series_year))
+                # Use the oldest year if any found, else empty string
+                year = str(min(years)) if years else ""
+            if not meta.get('no_year', False) and not meta.get('search_year', ''):
+                title = str(meta.get('title', ''))
+                otw_name = otw_name.replace(title, f"{title} {year}", 1)
+
+        return {'name': otw_name}
+
+    async def get_additional_data(self, meta: Meta) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            'mod_queue_opt_in': await self.get_flag(meta, 'modq'),
+        }
+
+        return data

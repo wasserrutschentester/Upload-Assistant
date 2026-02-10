@@ -1,45 +1,63 @@
-# -*- coding: utf-8 -*-
-# import discord
-import asyncio
-import requests
-import platform
-import os
-import glob
-import httpx
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
+import re
+from typing import Any, Optional, cast
 
-from src.trackers.COMMON import COMMON
 from src.console import console
+from src.languages import languages_manager
+from src.trackers.COMMON import COMMON
+from src.trackers.UNIT3D import UNIT3D
+
+Meta = dict[str, Any]
+Config = dict[str, Any]
 
 
-class ITT():
-    """
-    Edit for Tracker:
-        Edit BASE.torrent with announce and source
-        Check for duplicates
-        Set type/category IDs
-        Upload
-    """
-
-    def __init__(self, config):
-        self.config = config
+class ITT(UNIT3D):
+    def __init__(self, config: Config) -> None:
+        super().__init__(config, tracker_name='ITT')
+        self.config: Config = config
+        self.common = COMMON(config)
         self.tracker = 'ITT'
-        self.source_flag = 'ItaTorrents'
-        self.upload_url = 'https://itatorrents.xyz/api/torrents/upload'
-        self.search_url = 'https://itatorrents.xyz/api/torrents/filter'
-        self.torrent_url = 'https://itatorrents.xyz/torrents/'
-        self.signature = "\n[center][url=https://github.com/Audionut/Upload-Assistant]Created by Audionut's Upload Assistant[/url][/center]"
-        self.banned_groups = [""]
+        self.base_url = 'https://itatorrents.xyz'
+        self.id_url = f'{self.base_url}/api/torrents/'
+        self.upload_url = f'{self.base_url}/api/torrents/upload'
+        self.requests_url = f'{self.base_url}/api/requests/filter'
+        self.search_url = f'{self.base_url}/api/torrents/filter'
+        self.torrent_url = f'{self.base_url}/torrents/'
+        self.banned_groups = []
         pass
 
-    async def get_cat_id(self, category_name):
-        category_id = {
-            'MOVIE': '1',
-            'TV': '2',
-        }.get(category_name, '0')
-        return category_id
+    async def get_type_name(self, meta: Meta) -> Optional[str]:
+        type_name: Optional[str] = None
 
-    async def get_type_id(self, type):
-        type_id = {
+        uuid_string = meta.get('uuid', '')
+        if uuid_string:
+            lower_uuid = uuid_string.lower()
+
+            if 'dlmux' in lower_uuid:
+                type_name = 'DLMux'
+            elif 'bdmux' in lower_uuid:
+                type_name = 'BDMux'
+            elif 'webmux' in lower_uuid:
+                type_name = 'WEBMux'
+            elif 'dvdmux' in lower_uuid:
+                type_name = 'DVDMux'
+            elif 'bdrip' in lower_uuid:
+                type_name = 'BDRip'
+
+        if type_name is None:
+            type_value = meta.get('type')
+            type_name = str(type_value) if type_value else None
+
+        return type_name
+
+    async def get_type_id(
+        self,
+        meta: Meta,
+        type: Optional[str] = None,
+        reverse: bool = False,
+        mapping_only: bool = False
+    ) -> dict[str, str]:
+        type_id_map = {
             'DISC': '1',
             'REMUX': '2',
             'WEBDL': '4',
@@ -51,149 +69,123 @@ class ITT():
             'WEBMux': '26',
             'DVDMux': '39',
             'BDRip': '25',
-            'DVDRip': '24',
+            'DVDRIP': '24',
             'Cinema-MD': '14',
-            }.get(type, '0')
-        return type_id
-
-    async def get_res_id(self, resolution):
-        resolution_id = {
-            '8640p': '10',
-            '4320p': '1',
-            '2160p': '2',
-            '1440p': '3',
-            '1080p': '3',
-            '1080i': '4',
-            '720p': '5',
-            '576p': '6',
-            '576i': '7',
-            '480p': '8',
-            '480i': '9'
-        }.get(resolution, '10')
-        return resolution_id
-
-    async def upload(self, meta, disctype):
-        common = COMMON(config=self.config)
-        await common.edit_torrent(meta, self.tracker, self.source_flag)
-        cat_id = await self.get_cat_id(meta['category'])
-        type_id = await self.get_type_id(meta['type'])
-        resolution_id = await self.get_res_id(meta['resolution'])
-        await common.unit3d_edit_desc(meta, self.tracker, self.signature)
-        region_id = await common.unit3d_region_ids(meta.get('region'))
-        distributor_id = await common.unit3d_distributor_ids(meta.get('distributor'))
-        if meta['anon'] == 0 and not self.config['TRACKERS'][self.tracker].get('anon', "False"):
-            anon = 0
-        else:
-            anon = 1
-
-        if meta['bdinfo'] is not None:
-            mi_dump = None
-            bd_dump = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/BD_SUMMARY_00.txt", 'r', encoding='utf-8').read()
-        else:
-            mi_dump = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/MEDIAINFO.txt", 'r', encoding='utf-8').read()
-            bd_dump = None
-        desc = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}]DESCRIPTION.txt", 'r', encoding='utf-8').read()
-        open_torrent = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}].torrent", 'rb')
-        files = {'torrent': open_torrent}
-        base_dir = meta['base_dir']
-        uuid = meta['uuid']
-        specified_dir_path = os.path.join(base_dir, "tmp", uuid, "*.nfo")
-        nfo_files = glob.glob(specified_dir_path)
-        nfo_file = None
-        if nfo_files:
-            nfo_file = open(nfo_files[0], 'rb')
-        if nfo_file:
-            files['nfo'] = ("nfo_file.nfo", nfo_file, "text/plain")
-        data = {
-            'name': meta['name'],
-            'description': desc,
-            'mediainfo': mi_dump,
-            'bdinfo': bd_dump,
-            'category_id': cat_id,
-            'type_id': type_id,
-            'resolution_id': resolution_id,
-            'tmdb': meta['tmdb'],
-            'imdb': meta['imdb'],
-            'tvdb': meta['tvdb_id'],
-            'mal': meta['mal_id'],
-            'igdb': 0,
-            'anonymous': anon,
-            'stream': meta['stream'],
-            'sd': meta['sd'],
-            'keywords': meta['keywords'],
-            'personal_release': int(meta.get('personalrelease', False)),
-            'internal': 0,
-            'featured': 0,
-            'free': 0,
-            'doubleup': 0,
-            'sticky': 0,
         }
-        # Internal
-        if self.config['TRACKERS'][self.tracker].get('internal', False) is True:
-            if meta['tag'] != "" and (meta['tag'][1:] in self.config['TRACKERS'][self.tracker].get('internal_groups', [])):
-                data['internal'] = 1
+        if mapping_only:
+            return type_id_map
+        if reverse:
+            return {v: k for k, v in type_id_map.items()}
+        if type is not None:
+            return {'type_id': type_id_map.get(type, '0')}
 
-        if region_id != 0:
-            data['region_id'] = region_id
-        if distributor_id != 0:
-            data['distributor_id'] = distributor_id
+        resolved_type = await self.get_type_name(meta)
+        type_id = type_id_map.get(resolved_type or '', '0')
+
+        return {'type_id': type_id}
+
+    async def get_name(self, meta: Meta) -> dict[str, str]:
+        type_name = await self.get_type_name(meta) or ''
+        title = str(meta.get('title', ""))
+        year = str(meta.get('year', ""))
+        if int(meta.get('manual_year') or 0) > 0:
+            year = str(meta.get('manual_year'))
+        resolution = str(meta.get('resolution', ""))
+        if resolution == "OTHER":
+            resolution = ""
+        audio = str(meta.get('audio', ""))
+        season = str(meta.get('season') or "")
+        episode = str(meta.get('episode') or "")
+        repack = str(meta.get('repack', ""))
+        three_d = str(meta.get('3D', ""))
+        tag = str(meta.get('tag', ""))
+        source = str(meta.get('source', ""))
+        hdr = str(meta.get('hdr', ""))
+        video_codec = str(meta.get('video_codec', ""))
+        region = str(meta.get('region', ""))
+        if meta.get('is_disc', "") == "BDMV":
+            video_codec = str(meta.get('video_codec', ""))
+            region = str(meta.get('region', ""))
+        elif meta.get('is_disc', "") == "DVD":
+            region = str(meta.get('region', ""))
+        edition = str(meta.get('edition', ""))
+        if 'hybrid' in edition.upper():
+            edition = edition.replace('Hybrid', '').strip()
+
         if meta.get('category') == "TV":
-            data['season_number'] = meta.get('season_int', '0')
-            data['episode_number'] = meta.get('episode_int', '0')
-        headers = {
-            'User-Agent': f'Upload Assistant/2.2 ({platform.system()} {platform.release()})'
-        }
-        params = {
-            'api_token': self.config['TRACKERS'][self.tracker]['api_key'].strip()
-        }
+            year = str(meta.get('year', '')) if meta.get('search_year', "") != "" else ""
+            if meta.get('manual_date'):
+                season = ''
+                episode = ''
+        if meta.get('no_season', False) is True:
+            season = ''
+        if meta.get('no_year', False) is True:
+            year = ''
 
-        if meta['debug'] is False:
-            response = requests.post(url=self.upload_url, files=files, data=data, headers=headers, params=params)
-            try:
-                meta['tracker_status'][self.tracker]['status_message'] = response.json()
-                # adding torrent link to comment of torrent file
-                t_id = response.json()['data'].split(".")[1].split("/")[3]
-                meta['tracker_status'][self.tracker]['torrent_id'] = t_id
-                await common.add_tracker_torrent(meta, self.tracker, self.source_flag, self.config['TRACKERS'][self.tracker].get('announce_url'), "https://itatorrents.xyz/torrents/" + t_id)
-            except Exception:
-                console.print("It may have uploaded, go check")
-                return
+        dubs = await self.get_dubs(meta)
+
+        """
+        From https://itatorrents.xyz/wikis/20
+
+        Struttura Titolo per: Full Disc, Remux
+        Name Year S##E## Cut REPACK Resolution Edition Region 3D SOURCE TYPE Hi10P HDR VCodec Dub ACodec Channels Object-Tag
+
+        Struttura Titolo per: Encode, WEB-DL, WEBRip, HDTV, DLMux, BDMux, WEBMux, DVDMux, BDRip, DVDRip
+        Name Year S##E## Cut REPACK Resolution Edition 3D SOURCE TYPE Dub ACodec Channels Object Hi10P HDR VCodec-Tag
+        """
+
+        if type_name == 'DISC' or type_name == "REMUX":
+            itt_name = f"{title} {year} {season}{episode} {repack} {resolution} {edition} {region} {three_d} {source} {'REMUX' if type_name == 'REMUX' else ''} {hdr} {video_codec} {dubs} {audio}"
+
         else:
-            console.print("[cyan]Request Data:")
-            console.print(data)
-            meta['tracker_status'][self.tracker]['status_message'] = "Debug mode enabled, not uploading."
-        open_torrent.close()
+            type_name = (
+                type_name
+                .replace('WEBDL', 'WEB-DL')
+                .replace('WEBRIP', 'WEBRip')
+                .replace('DVDRIP', 'DVDRip')
+                .replace('ENCODE', 'BluRay')
+            )
+            itt_name = f"{title} {year} {season}{episode} {repack} {resolution} {edition} {three_d} {type_name} {dubs} {audio} {hdr} {video_codec}"
 
-    async def search_existing(self, meta, disctype):
-        dupes = []
-        params = {
-            'api_token': self.config['TRACKERS'][self.tracker]['api_key'].strip(),
-            'tmdbId': meta['tmdb'],
-            'categories[]': await self.get_cat_id(meta['category']),
-            'types[]': await self.get_type_id(meta['type']),
-            'resolutions[]': await self.get_res_id(meta['resolution']),
-            'name': ""
-        }
-        if meta['category'] == 'TV':
-            params['name'] = params['name'] + f" {meta.get('season', '')}"
-        if meta.get('edition', "") != "":
-            params['name'] = params['name'] + f" {meta['edition']}"
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(url=self.search_url, params=params)
-                if response.status_code == 200:
-                    data = response.json()
-                    for each in data['data']:
-                        result = [each][0]['attributes']['name']
-                        dupes.append(result)
-                else:
-                    console.print(f"[bold red]Failed to search torrents. HTTP Status: {response.status_code}")
-        except httpx.TimeoutException:
-            console.print("[bold red]Request timed out after 5 seconds")
-        except httpx.RequestError as e:
-            console.print(f"[bold red]Unable to search for existing torrents: {e}")
-        except Exception as e:
-            console.print(f"[bold red]Unexpected error: {e}")
-            await asyncio.sleep(5)
+            itt_name = ' '.join(itt_name.split())
+        except Exception:
+            console.print("[bold red]Unable to generate name. Please re-run and correct any of the following args if needed.")
+            console.print(f"--category [yellow]{meta['category']}")
+            console.print(f"--type [yellow]{meta['type']}")
+            console.print(f"--source [yellow]{meta['source']}")
+            console.print("[bold green]If you specified type, try also specifying source")
 
-        return dupes
+            exit()
+        name_notag = itt_name
+        itt_name = name_notag + tag
+        itt_name = itt_name.replace('Dubbed', '').replace('Dual-Audio', '')
+
+        return {"name": re.sub(r"\s{2,}", " ", itt_name)}
+
+    async def get_dubs(self, meta: Meta) -> str:
+        if not meta.get('language_checked', False):
+            await languages_manager.process_desc_language(meta, tracker=self.tracker)
+        dubs = ''
+        audio_languages_value = meta.get('audio_languages', [])
+        audio_languages: set[str] = set()
+        if isinstance(audio_languages_value, list):
+            audio_languages_list = cast(list[Any], audio_languages_value)
+            audio_languages = {str(lang) for lang in audio_languages_list}
+        if audio_languages:
+            dubs = " ".join(lang[:3].upper() for lang in audio_languages)
+        return dubs
+
+    async def get_additional_checks(self, meta: Meta) -> bool:
+        # From rules:
+        # "Non sono ammessi film e serie tv che non comprendono il doppiaggio in italiano."
+        # Translates to "Films and TV series that do not include Italian dubbing are not permitted."
+        italian_languages = ["italian", "italiano"]
+        if not await self.common.check_language_requirements(
+            meta, self.tracker, languages_to_check=italian_languages, check_audio=True
+        ):
+            console.print(
+                "Upload Rules: https://itatorrents.xyz/wikis/5"
+            )
+            return False
+        return True

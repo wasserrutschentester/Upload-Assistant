@@ -1,8 +1,18 @@
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
 import re
-from guessit import guessit
+from typing import Any, Callable, Optional, Union, cast
+
+import guessit
+
+guessit_module: Any = cast(Any, guessit)
+GuessitFn = Callable[[str, Optional[dict[str, Any]]], dict[str, Any]]
 
 
-async def get_region(bdinfo, region=None):
+def guessit_fn(value: str, options: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    return cast(dict[str, Any], guessit_module.guessit(value, options))
+
+
+async def get_region(bdinfo: dict[str, Any], region: Optional[str] = None) -> str:
     label = bdinfo.get('label', bdinfo.get('title', bdinfo.get('path', ''))).replace('.', ' ')
     if region is not None:
         region = region.upper()
@@ -53,7 +63,7 @@ async def get_region(bdinfo, region=None):
     return region
 
 
-async def get_distributor(distributor_in):
+async def get_distributor(distributor_in: Optional[str]) -> str:
     distributor_list = [
         '01 DISTRIBUTION', '100 DESTINATIONS TRAVEL FILM', '101 FILMS', '1FILMS', '2 ENTERTAIN VIDEO', '20TH CENTURY FOX', '2L', '3D CONTENT HUB', '3D MEDIA', '3L FILM', '4DIGITAL', '4DVD', '4K ULTRA HD MOVIES', '4K UHD', '8-FILMS', '84 ENTERTAINMENT', '88 FILMS', '@ANIME', 'ANIME', 'A CONTRACORRIENTE', 'A CONTRACORRIENTE FILMS', 'A&E HOME VIDEO', 'A&E', 'A&M RECORDS', 'A+E NETWORKS', 'A+R', 'A-FILM', 'AAA', 'AB VIDÉO', 'AB VIDEO', 'ABC - (AUSTRALIAN BROADCASTING CORPORATION)', 'ABC', 'ABKCO', 'ABSOLUT MEDIEN', 'ABSOLUTE', 'ACCENT FILM ENTERTAINMENT', 'ACCENTUS', 'ACORN MEDIA', 'AD VITAM', 'ADA', 'ADITYA VIDEOS', 'ADSO FILMS', 'AFM RECORDS', 'AGFA', 'AIX RECORDS',
         'ALAMODE FILM', 'ALBA RECORDS', 'ALBANY RECORDS', 'ALBATROS', 'ALCHEMY', 'ALIVE', 'ALL ANIME', 'ALL INTERACTIVE ENTERTAINMENT', 'ALLEGRO', 'ALLIANCE', 'ALPHA MUSIC', 'ALTERDYSTRYBUCJA', 'ALTERED INNOCENCE', 'ALTITUDE FILM DISTRIBUTION', 'ALUCARD RECORDS', 'AMAZING D.C.', 'AMAZING DC', 'AMMO CONTENT', 'AMUSE SOFT ENTERTAINMENT', 'ANCONNECT', 'ANEC', 'ANIMATSU', 'ANIME HOUSE', 'ANIME LTD', 'ANIME WORKS', 'ANIMEIGO', 'ANIPLEX', 'ANOLIS ENTERTAINMENT', 'ANOTHER WORLD ENTERTAINMENT', 'AP INTERNATIONAL', 'APPLE', 'ARA MEDIA', 'ARBELOS', 'ARC ENTERTAINMENT', 'ARP SÉLECTION', 'ARP SELECTION', 'ARROW', 'ART SERVICE', 'ART VISION', 'ARTE ÉDITIONS', 'ARTE EDITIONS', 'ARTE VIDÉO',
@@ -71,30 +81,30 @@ async def get_distributor(distributor_in):
         'MASTERS OF CINEMA', 'MOC'
     ]
     distributor_out = ""
-    if distributor_in not in [None, "None", ""]:
+    if distributor_in is not None and distributor_in not in ["None", ""]:
         for each in distributor_list:
             if distributor_in.upper() == each:
                 distributor_out = each
     return distributor_out
 
 
-async def get_service(video=None, tag=None, audio=None, guess_title=None, get_services_only=False):
+async def get_service(video: Optional[str] = None, tag: Optional[str] = None, audio: Optional[str] = None, guess_title: Optional[str] = None, get_services_only: bool = False) -> Union[dict[str, str], tuple[str, str]]:
     services = {
         '9NOW': '9NOW', '9Now': '9NOW', 'ADN': 'ADN', 'Animation Digital Network': 'ADN', 'AE': 'AE', 'A&E': 'AE', 'AJAZ': 'AJAZ', 'Al Jazeera English': 'AJAZ',
         'ALL4': 'ALL4', 'Channel 4': 'ALL4', 'AMBC': 'AMBC', 'ABC': 'AMBC', 'AMC': 'AMC', 'AMZN': 'AMZN',
         'Amazon Prime': 'AMZN', 'ANLB': 'ANLB', 'AnimeLab': 'ANLB', 'ANPL': 'ANPL', 'Animal Planet': 'ANPL',
         'AOL': 'AOL', 'ARD': 'ARD', 'AS': 'AS', 'Adult Swim': 'AS', 'ATK': 'ATK', "America's Test Kitchen": 'ATK', 'ATV': 'ATV', 'Apple TV': 'ATV',
-        'ATVP': 'ATVP', 'Apple TV+': 'ATVP', 'AUBC': 'AUBC', 'ABC Australia': 'AUBC', 'BCORE': 'BCORE', 'BKPL': 'BKPL',
-        'Blackpills': 'BKPL', 'BluTV': 'BLU', 'Binge': 'BNGE', 'BOOM': 'BOOM', 'Boomerang': 'BOOM', 'BRAV': 'BRAV',
+        'ATVP': 'ATVP', 'Apple TV+': 'ATVP', 'AUBC': 'AUBC', 'ABC Australia': 'AUBC', 'BCORE': 'BCORE', 'Bilibili': 'BILI', 'BILI': 'BILI', 'BKPL': 'BKPL',
+        'Blackpills': 'BKPL', 'BluTV': 'BLU', 'Binge': 'BNGE', 'BOOM': 'BOOM', 'Boomerang': 'BOOM', 'Brasil Paralelo': 'BP', 'BP': 'BP', 'BRAV': 'BRAV',
         'BravoTV': 'BRAV', 'CBC': 'CBC', 'CBS': 'CBS', 'CC': 'CC', 'Comedy Central': 'CC', 'CCGC': 'CCGC',
         'Comedians in Cars Getting Coffee': 'CCGC', 'CHGD': 'CHGD', 'CHRGD': 'CHGD', 'CMAX': 'CMAX', 'Cinemax': 'CMAX',
         'CMOR': 'CMOR', 'CMT': 'CMT', 'Country Music Television': 'CMT', 'CN': 'CN', 'Cartoon Network': 'CN', 'CNBC': 'CNBC',
         'CNLP': 'CNLP', 'Canal+': 'CNLP', 'CNGO': 'CNGO', 'Cinego': 'CNGO', 'COOK': 'COOK', 'CORE': 'CORE', 'CR': 'CR',
-        'Crunchy Roll': 'CR', 'Crave': 'CRAV', 'CRIT': 'CRIT', 'Criterion': 'CRIT', 'CRKL': 'CRKL', 'Crackle': 'CRKL',
-        'CSPN': 'CSPN', 'CSpan': 'CSPN', 'CTV': 'CTV', 'CUR': 'CUR', 'CuriosityStream': 'CUR', 'CW': 'CW', 'The CW': 'CW',
+        'Crunchy Roll': 'CR', 'Crave': 'CRAV', 'CRAV': 'CRAV', 'CRIT': 'CRIT', 'Criterion': 'CRIT', 'Chorki': 'CRKI', 'CRKI': 'CRKI', 'CRKL': 'CRKL', 'Crackle': 'CRKL',
+        'CSPN': 'CSPN', 'CSpan': 'CSPN', 'CTHP': 'CTHP', 'CTV': 'CTV', 'CUR': 'CUR', 'CuriosityStream': 'CUR', 'CW': 'CW', 'The CW': 'CW',
         'CWS': 'CWS', 'CWSeed': 'CWS', 'DAZN': 'DAZN', 'DCU': 'DCU', 'DC Universe': 'DCU', 'DDY': 'DDY',
         'Digiturk Diledigin Yerde': 'DDY', 'DEST': 'DEST', 'DramaFever': 'DF', 'DHF': 'DHF', 'Deadhouse Films': 'DHF',
-        'DISC': 'DISC', 'Discovery': 'DISC', 'DIY': 'DIY', 'DIY Network': 'DIY', 'DOCC': 'DOCC', 'Doc Club': 'DOCC',
+        'DISC': 'DISC', 'Discovery': 'DISC', 'DIY': 'DIY', 'DIY Network': 'DIY', 'DOCC': 'DOCC', 'Doc Club': 'DOCC', 'DOCPLAY': 'DOCPLAY',
         'DPLY': 'DPLY', 'DPlay': 'DPLY', 'DRPO': 'DRPO', 'Discovery Plus': 'DSCP', 'DSKI': 'DSKI', 'Daisuki': 'DSKI',
         'DSNP': 'DSNP', 'Disney+': 'DSNP', 'DSNY': 'DSNY', 'Disney': 'DSNY', 'DTV': 'DTV', 'EPIX': 'EPIX', 'ePix': 'EPIX',
         'ESPN': 'ESPN', 'ESQ': 'ESQ', 'Esquire': 'ESQ', 'ETTV': 'ETTV', 'El Trece': 'ETTV', 'ETV': 'ETV', 'E!': 'ETV',
@@ -103,14 +113,14 @@ async def get_service(video=None, tag=None, audio=None, guess_title=None, get_se
         'UFC Fight Pass': 'FP', 'FPT': 'FPT', 'FREE': 'FREE', 'Freeform': 'FREE', 'FTV': 'FTV', 'FUNI': 'FUNI', 'FUNi': 'FUNI',
         'Foxtel': 'FXTL', 'FYI': 'FYI', 'FYI Network': 'FYI', 'GC': 'GC', 'NHL GameCenter': 'GC', 'GLBL': 'GLBL',
         'Global': 'GLBL', 'GLBO': 'GLBO', 'Globoplay': 'GLBO', 'GLOB': 'GLOB', 'GloboSat Play': 'GLOB', 'GO90': 'GO90', 'GagaOOLala': 'Gaga', 'HBO': 'HBO',
-        'HBO Go': 'HBO', 'HGTV': 'HGTV', 'HIDI': 'HIDI', 'HIST': 'HIST', 'History': 'HIST', 'HLMK': 'HLMK', 'Hallmark': 'HLMK',
-        'HMAX': 'HMAX', 'HBO Max': 'HMAX', 'HS': 'HTSR', 'HTSR': 'HTSR', 'HSTR': 'Hotstar', 'HULU': 'HULU', 'Hulu': 'HULU',
+        'HBO Go': 'HBO', 'HGTV': 'HGTV', 'HIDI': 'HIDI', 'HiDive': 'HIDI', 'HIST': 'HIST', 'History': 'HIST', 'HLMK': 'HLMK', 'Hallmark': 'HLMK',
+        'HMAX': 'HMAX', 'HBO Max': 'HMAX', 'HBOMAX': 'HMAX', 'HS': 'HTSR', 'HTSR': 'HTSR', 'HSTR': 'Hotstar', 'HULU': 'HULU', 'Hulu': 'HULU',
         'hoichoi': 'HoiChoi', 'ID': 'ID', 'Investigation Discovery': 'ID', 'IFC': 'IFC', 'iflix': 'IFX',
         'National Audiovisual Institute': 'INA', 'ITV': 'ITV', 'JOYN': 'JOYN', 'KAYO': 'KAYO', 'KNOW': 'KNOW', 'Knowledge Network': 'KNOW',
-        'KNPY': 'KNPY', 'Kanopy': 'KNPY', 'LIFE': 'LIFE', 'Lifetime': 'LIFE', 'LN': 'LN', 'MA': 'MA', 'Looke': 'LOOKE', 'LOOKE': 'LOOKE', 'Movies Anywhere': 'MA',
+        'KNPY': 'KNPY', 'Kanopy': 'KNPY', 'Kocowa+': 'KCW', 'Kocowa': 'KCW', 'KCW': 'KCW', 'LIFE': 'LIFE', 'Lifetime': 'LIFE', 'LN': 'LN', 'MA': 'MA', 'Looke': 'LOOKE', 'LOOKE': 'LOOKE', 'Movies Anywhere': 'MA',
         'MAX': 'MAX', 'MBC': 'MBC', 'MNBC': 'MNBC', 'MSNBC': 'MNBC', 'MTOD': 'MTOD', 'Motor Trend OnDemand': 'MTOD', 'MTV': 'MTV',
         'MUBI': 'MUBI', 'NATG': 'NATG', 'National Geographic': 'NATG', 'NBA': 'NBA', 'NBA TV': 'NBA', 'NBC': 'NBC', 'NF': 'NF',
-        'Netflix': 'NF', 'National Film Board': 'NFB', 'NFL': 'NFL', 'NFLN': 'NFLN', 'NFL Now': 'NFLN', 'NICK': 'NICK',
+        'NBLA': 'NBLA', 'Nebula': 'NBLA', 'Netflix': 'NF', 'National Film Board': 'NFB', 'NFL': 'NFL', 'NFLN': 'NFLN', 'NFL Now': 'NFLN', 'NICK': 'NICK',
         'Nickelodeon': 'NICK', 'NOW': 'NOW', 'NOWTV': 'NOW', 'NRK': 'NRK', 'Norsk Rikskringkasting': 'NRK', 'OnDemandKorea': 'ODK', 'Opto': 'OPTO',
         'ORF': 'ORF', 'ORF ON': 'ORF', 'Oprah Winfrey Network': 'OWN', 'PA': 'PA', 'PBS': 'PBS', 'PBSK': 'PBSK', 'PBS Kids': 'PBSK',
         'PCOK': 'PCOK', 'Peacock': 'PCOK', 'PLAY': 'PLAY', 'PLTV': 'PLTV', 'Pluto TV': 'PLTV', 'PLUZ': 'PLUZ', 'Pluzz': 'PLUZ', 'PMNP': 'PMNP', 'PMNT': 'PMNT',
@@ -122,28 +132,38 @@ async def get_service(video=None, tag=None, audio=None, guess_title=None, get_se
         'Spike': 'SPIK', 'Spike TV': 'SPKE', 'SPRT': 'SPRT', 'Sprout': 'SPRT', 'STAN': 'STAN', 'Stan': 'STAN', 'STARZ': 'STARZ',
         'STRP': 'STRP', 'Star+': 'STRP', 'STZ': 'STZ', 'Starz': 'STZ', 'SVT': 'SVT', 'Sveriges Television': 'SVT', 'SWER': 'SWER',
         'SwearNet': 'SWER', 'SYFY': 'SYFY', 'Syfy': 'SYFY', 'TBS': 'TBS', 'TEN': 'TEN', 'TIMV': 'TIMV', 'TIMvision': 'TIMV',
-        'TFOU': 'TFOU', 'TFou': 'TFOU', 'TIMV': 'TIMV', 'TLC': 'TLC', 'TOU': 'TOU', 'TRVL': 'TRVL', 'TUBI': 'TUBI', 'TubiTV': 'TUBI',
+        'TFOU': 'TFOU', 'TFou': 'TFOU', 'TLC': 'TLC', 'TOU': 'TOU', 'TRVL': 'TRVL', 'TUBI': 'TUBI', 'TubiTV': 'TUBI',
         'TV3': 'TV3', 'TV3 Ireland': 'TV3', 'TV4': 'TV4', 'TV4 Sweeden': 'TV4', 'TVING': 'TVING', 'TVL': 'TVL', 'TV Land': 'TVL',
         'TVNZ': 'TVNZ', 'UFC': 'UFC', 'UKTV': 'UKTV', 'UNIV': 'UNIV', 'Univision': 'UNIV', 'USAN': 'USAN', 'USA Network': 'USAN',
         'VH1': 'VH1', 'VIAP': 'VIAP', 'VICE': 'VICE', 'Viceland': 'VICE', 'Viki': 'VIKI', 'VIMEO': 'VIMEO', 'Vivamax': 'VMAX', 'VMAX': 'VMAX', 'Vivaone': 'VONE', 'VONE': 'VONE', 'VLCT': 'VLCT',
         'Velocity': 'VLCT', 'VMEO': 'VMEO', 'Vimeo': 'VMEO', 'VRV': 'VRV', 'VUDU': 'VUDU', 'WME': 'WME', 'WatchMe': 'WME', 'WNET': 'WNET',
-        'W Network': 'WNET', 'WWEN': 'WWEN', 'WWE Network': 'WWEN', 'XBOX': 'XBOX', 'Xbox Video': 'XBOX', 'XUMO': 'XUMO', 'YHOO': 'YHOO', 'Yahoo': 'YHOO',
-        'YT': 'YT', 'ZDF': 'ZDF', 'iP': 'iP', 'BBC iPlayer': 'iP', 'iQIYI': 'iQIYI', 'iT': 'iT', 'iTunes': 'iT'
-    }
+        'W Network': 'WNET', 'WOW Presents Plus': 'WOWP', 'WOWP': 'WOWP', 'WWEN': 'WWEN', 'WWE Network': 'WWEN', 'XBOX': 'XBOX', 'Xbox Video': 'XBOX', 'XUMO': 'XUMO', 'YHOO': 'YHOO', 'Yahoo': 'YHOO',
+        'YT': 'YT', 'ZDF': 'ZDF', 'iP': 'iP', 'BBC iPlayer': 'iP', 'iQIYI': 'iQIYI', 'iT': 'iT', 'iTunes': 'iT',
+        'MGG': 'MGG', 'Megogo': 'MGG', 'MEGOGO': 'MGG', 'MeGoGo': 'MGG',
+        'SWEET': 'SWEET',
+        'KS': 'KS', 'Kyivstar': 'KS', 'KyivstarTV': 'KS', 'Kyivstar TV': 'KS', 'kyivstar': 'KS',
+        'PKO': 'PKO', 'Planeta Kino Online': 'PKO',
+        'TF': 'TF', 'takflix': 'TF', 'Takflix': 'TF'
+    }  # fmt: off
 
     if get_services_only:
         return services
-    service = guessit(video).get('streaming_service', "")
 
-    video_name = re.sub(r"[.()]", " ", video.replace(tag, '').replace(guess_title, ''))
-    if "DTS-HD MA" in audio:
+    if video is None:
+        return "", ""
+
+    guess_data = guessit_fn(video)
+    service: str = str(guess_data.get('streaming_service', ""))
+
+    video_name = re.sub(r"[.()]", " ", video.replace(tag or '', '').replace(guess_title or '', ''))
+    if audio and "DTS-HD MA" in audio:
         video_name = video_name.replace("DTS-HD.MA.", "").replace("DTS-HD MA ", "")
+    title_guess = guessit_fn(video, {"excludes": ["country", "language"]})
+    title_guess_title = str(title_guess.get('title', ''))
     for key, value in services.items():
-        if (' ' + key + ' ') in video_name and key not in guessit(video, {"excludes": ["country", "language"]}).get('title', ''):
+        if (' ' + key + ' ') in video_name and key not in title_guess_title or key == service:
             service = value
-        elif key == service:
-            service = value
-    service_longname = service
+    service_longname: str = service
     for key, value in services.items():
         if value == service and len(key) > len(service_longname):
             service_longname = key

@@ -1,636 +1,190 @@
-from torf import Torrent
-import os
-import requests
-import re
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
+import asyncio
+import hashlib
 import json
-import click
-import sys
-import glob
-from pymediainfo import MediaInfo
+import os
+import re
 import secrets
+import sys
+from typing import Any, Callable, Optional, Union, cast
+
+import aiofiles
+import bencodepy
+import cli_ui
+import click
+import httpx
+import langcodes
+from langcodes import tag_parser
+from torf import Torrent
+
 from src.bbcode import BBCODE
 from src.console import console
-from src.uploadscreens import upload_screens
-from src.takescreens import disc_screenshots, dvd_screenshots, screenshots
-from src.languages import process_desc_language
+from src.exportmi import exportInfo
+from src.languages import languages_manager
 
 
-class COMMON():
-    def __init__(self, config):
+class COMMON:
+    def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
         self.parser = self.MediaInfoParser()
         pass
 
-    async def edit_torrent(self, meta, tracker, source_flag, torrent_filename="BASE"):
-        if os.path.exists(f"{meta['base_dir']}/tmp/{meta['uuid']}/{torrent_filename}.torrent"):
-            new_torrent = Torrent.read(f"{meta['base_dir']}/tmp/{meta['uuid']}/{torrent_filename}.torrent")
+    async def path_exists(self, path: str) -> bool:
+        """Async wrapper for os.path.exists"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, os.path.exists, path)
+
+    async def remove_file(self, path: str) -> None:
+        """Async wrapper for os.remove"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, os.remove, path)
+
+    async def makedirs(self, path: str, exist_ok: bool = True) -> None:
+        """Async wrapper for os.makedirs"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda p, e: os.makedirs(p, exist_ok=e), path, exist_ok)
+
+    async def create_torrent_for_upload(
+        self,
+        meta: dict[str, Any],
+        tracker: str,
+        source_flag: str,
+        torrent_filename: str = "BASE",
+        announce_url: str = "",
+    ) -> None:
+        path = f"{meta['base_dir']}/tmp/{meta['uuid']}/{torrent_filename}.torrent"
+        if await self.path_exists(path):
+            loop = asyncio.get_running_loop()
+            new_torrent = await loop.run_in_executor(None, Torrent.read, path)
             for each in list(new_torrent.metainfo):
                 if each not in ('announce', 'comment', 'creation date', 'created by', 'encoding', 'info'):
-                    new_torrent.metainfo.pop(each, None)
-            new_torrent.metainfo['announce'] = self.config['TRACKERS'][tracker].get('announce_url', "https://fake.tracker").strip()
+                    new_torrent.metainfo.pop(each, None)  # type: ignore
+            if announce_url:
+                new_torrent.metainfo['announce'] = announce_url
+            else:
+                raw_announce = self.config['TRACKERS'][tracker].get('announce_url')
+                new_torrent.metainfo['announce'] = str(raw_announce).strip() if raw_announce else "https://fake.tracker"
             new_torrent.metainfo['info']['source'] = source_flag
-            if 'created by' in new_torrent.metainfo and isinstance(new_torrent.metainfo['created by'], str):
-                created_by = new_torrent.metainfo['created by']
+            if 'created by' in new_torrent.metainfo:
+                created_by = str(new_torrent.metainfo['created by'])
                 if "mkbrr" in created_by.lower():
-                    new_torrent.metainfo['created by'] = f"{created_by} using Audionut's Upload Assistant"
-            if int(meta.get('entropy', None)) == 32:
-                new_torrent.metainfo['info']['entropy'] = secrets.randbelow(2**31)
-            elif int(meta.get('entropy', None)) == 64:
-                new_torrent.metainfo['info']['entropy'] = secrets.randbelow(2**64)
+                    new_torrent.metainfo['created by'] = f"{created_by} using Upload Assistant"
             # setting comment as blank as if BASE.torrent is manually created then it can result in private info such as download link being exposed.
             new_torrent.metainfo['comment'] = ''
+            entropy_value = meta.get('entropy')
+            if entropy_value is not None:
+                try:
+                    entropy_int = int(entropy_value)
+                    if entropy_int == 32:
+                        new_torrent.metainfo['info']['entropy'] = secrets.randbelow(2**32)  # type: ignore
+                    elif entropy_int == 64:
+                        new_torrent.metainfo['info']['entropy'] = secrets.randbelow(2**64)  # type: ignore
+                except (ValueError, TypeError):
+                    # Skip entropy setting if value is invalid
+                    pass
+            out_path = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}].torrent"
+            await loop.run_in_executor(None, lambda: Torrent.copy(new_torrent).write(out_path, overwrite=True))
 
-            Torrent.copy(new_torrent).write(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}].torrent", overwrite=True)
+    async def download_tracker_torrent(
+        self,
+        meta: dict[str, Any],
+        tracker: str,
+        headers: Optional[dict[str, str]] = None,
+        params: Optional[dict[str, str]] = None,
+        downurl: str = "",
+        hash_is_id: bool = False,
+        cross: bool = False,
+    ) -> Optional[str]:
+        path = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}_cross].torrent" if cross else f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}].torrent"
+        if downurl:
+            try:
+                async with httpx.AsyncClient(headers=headers, params=params, timeout=30.0) as session, session.stream("GET", downurl) as r:
+                    r.raise_for_status()
+                    async with aiofiles.open(path, "wb") as f:
+                        async for chunk in r.aiter_bytes():
+                            await f.write(chunk)
 
-    # used to add tracker url, comment and source flag to torrent file
-    async def add_tracker_torrent(self, meta, tracker, source_flag, new_tracker, comment):
-        if os.path.exists(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}].torrent"):
-            new_torrent = Torrent.read(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}].torrent")
+                if cross:
+                    return None
 
-            # handle trackers with multiple announce links
+                if hash_is_id:
+                    torrent_hash = await self.get_torrent_hash(meta, tracker)
+                    return torrent_hash
+                return None
+
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not download torrent file: {str(e)}[/yellow]")
+                console.print("[yellow]Download manually from the tracker.[/yellow]")
+                return None
+
+        return None
+
+    async def create_torrent_ready_to_seed(
+        self,
+        meta: dict[str, Any],
+        tracker: str,
+        source_flag: str,
+        new_tracker: Union[str, list[str]],
+        comment: str = "",
+        hash_is_id: bool = False,
+    ) -> Optional[str]:
+        """
+        Modifies the torrent file to include the tracker's announce URL, a comment, and a source flag.
+        """
+        path = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}].torrent"
+        if await self.path_exists(path):
+            loop = asyncio.get_running_loop()
+            new_torrent = await loop.run_in_executor(None, Torrent.read, path)
             if isinstance(new_tracker, list):
-                new_torrent.metainfo['announce'] = new_tracker[0]
-                new_torrent.metainfo['announce-list'] = [new_tracker]
+                if not new_tracker:
+                    console.print(f"[red]Error: Empty tracker list provided for {tracker}. Cannot create torrent.[/red]")
+                    return None
+                new_torrent.metainfo["announce"] = new_tracker[0]
+                new_torrent.metainfo["announce-list"] = [new_tracker]
             else:
-                new_torrent.metainfo['announce'] = new_tracker
+                new_torrent.metainfo["announce"] = new_tracker
+            new_torrent.metainfo["info"]["source"] = source_flag
 
-            new_torrent.metainfo['comment'] = comment
-            new_torrent.metainfo['info']['source'] = source_flag
-            Torrent.copy(new_torrent).write(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}].torrent", overwrite=True)
-
-    async def unit3d_edit_desc(self, meta, tracker, signature, comparison=False, desc_header="", image_list=None):
-        if image_list is not None:
-            images = image_list
-            multi_screens = 0
-        else:
-            images = meta['image_list']
-            multi_screens = int(self.config['DEFAULT'].get('multiScreens', 2))
-
-        # Check for saved pack_image_links.json file
-        pack_images_file = os.path.join(meta['base_dir'], "tmp", meta['uuid'], "pack_image_links.json")
-        pack_images_data = {}
-        if os.path.exists(pack_images_file):
-            try:
-                with open(pack_images_file, 'r', encoding='utf-8') as f:
-                    pack_images_data = json.load(f)
-                    if meta['debug']:
-                        console.print(f"[green]Loaded previously uploaded images from {pack_images_file}")
-                        console.print(f"[blue]Found {pack_images_data.get('total_count', 0)} previously uploaded images")
-            except Exception as e:
-                console.print(f"[yellow]Warning: Could not load pack image data: {str(e)}[/yellow]")
-
-        base = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/DESCRIPTION.txt", 'r', encoding='utf8').read()
-        char_limit = int(self.config['DEFAULT'].get('charLimit', 14000))
-        file_limit = int(self.config['DEFAULT'].get('fileLimit', 5))
-        thumb_size = int(self.config['DEFAULT'].get('pack_thumb_size', '300'))
-        cover_size = int(self.config['DEFAULT'].get('bluray_image_size', '250'))
-        process_limit = int(self.config['DEFAULT'].get('processLimit', 10))
-        episode_overview = int(self.config['DEFAULT'].get('episode_overview', False))
-        try:
-            # If tracker has screenshot header specified in config, use that. Otherwise, check if screenshot default is used. Otherwise, fall back to None
-            screenheader = self.config['TRACKERS'][tracker].get('custom_screenshot_header', self.config['DEFAULT'].get('screenshot_header', None))
-        except Exception:
-            screenheader = None
-        try:
-            # If tracker has description header specified in config, use that. Otherwise, check if custom description header default is used.
-            desc_header = self.config['TRACKERS'][tracker].get('custom_description_header', self.config['DEFAULT'].get('custom_description_header', desc_header))
-        except Exception as e:
-            console.print(f"[yellow]Warning: Error setting custom description header: {str(e)}[/yellow]")
-        try:
-            # If screensPerRow is set, use that to determine how many screenshots should be on each row. Otherwise, use 2 as default
-            screensPerRow = int(self.config['DEFAULT'].get('screens_per_row', 2))
-        except Exception:
-            screensPerRow = 2
-        try:
-            # If custom signature set and isn't empty, use that instead of the signature parameter
-            custom_signature = self.config['TRACKERS'][tracker].get('custom_signature', signature)
-            if custom_signature != '':
-                signature = custom_signature
-        except Exception as e:
-            console.print(f"[yellow]Warning: Error setting custom signature: {str(e)}[/yellow]")
-        with open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}]DESCRIPTION.txt", 'w', encoding='utf8') as descfile:
-            if desc_header:
-                if not desc_header.endswith('\n'):
-                    descfile.write(desc_header + '\n')
-                else:
-                    descfile.write(desc_header)
-            await process_desc_language(meta, descfile, tracker)
-            add_logo_enabled = self.config["DEFAULT"].get("add_logo", False)
-            if add_logo_enabled and 'logo' in meta:
-                logo = meta['logo']
-                logo_size = self.config["DEFAULT"].get("logo_size", 420)
-                if logo != "":
-                    descfile.write(f"[center][img={logo_size}]{logo}[/img][/center]\n\n")
-            bluray_link = self.config['DEFAULT'].get("add_bluray_link", False)
-            if meta.get('is_disc') == "BDMV" and bluray_link and meta.get('release_url', ''):
-                descfile.write(f"[center]{meta['release_url']}[/center]\n")
-            covers = False
-            if os.path.exists(f"{meta['base_dir']}/tmp/{meta['uuid']}/covers.json"):
-                covers = True
-            if meta.get('is_disc') == "BDMV" and self.config['DEFAULT'].get('use_bluray_images', False) and covers:
-                with open(f"{meta['base_dir']}/tmp/{meta['uuid']}/covers.json", 'r', encoding='utf-8') as f:
-                    cover_data = json.load(f)
-                if isinstance(cover_data, list):
-                    descfile.write("[center]")
-
-                    for img_data in cover_data:
-                        if 'raw_url' in img_data and 'web_url' in img_data:
-                            web_url = img_data['web_url']
-                            raw_url = img_data['raw_url']
-                            descfile.write(f"[url={web_url}][img={cover_size}]{raw_url}[/img][/url]")
-
-                    descfile.write("[/center]\n\n")
-            season_name = meta.get('tvdb_season_name') if meta.get('tvdb_season_name') is not None and meta.get('tvdb_season_name') != "" else None
-            season_number = meta.get('tvdb_season_number') if meta.get('tvdb_season_number') is not None and meta.get('tvdb_season_number') != "" else None
-            episode_number = meta.get('tvdb_episode_number') if meta.get('tvdb_episode_number') is not None and meta.get('tvdb_episode_number') != "" else None
-            episode_title = meta.get('auto_episode_title') if meta.get('auto_episode_title') is not None and meta.get('auto_episode_title') != "" else None
-            if episode_title is None:
-                episode_title = meta.get('tvmaze_episode_data', {}).get('episode_name') if meta.get('tvmaze_episode_data', {}).get('episode_name') else None
-            if episode_overview and season_name and season_number and episode_number and episode_title:
-                if not tracker == "HUNO":
-                    descfile.write("[center][pre]")
-                else:
-                    descfile.write("[center]")
-                descfile.write(f"{season_name} - S{season_number}E{episode_number}: {episode_title}")
-                if not tracker == "HUNO":
-                    descfile.write("[/pre][/center]\n\n")
-                else:
-                    descfile.write("[/center]\n\n")
-            if episode_overview and meta.get('overview_meta') is not None and meta.get('overview_meta') != "":
-                episode_data = meta.get('overview_meta')
-                if not tracker == "HUNO":
-                    descfile.write("[center][pre]")
-                else:
-                    descfile.write("[center]")
-                descfile.write(episode_data)
-                if not tracker == "HUNO":
-                    descfile.write("[/pre][/center]\n\n")
-                else:
-                    descfile.write("[/center]\n\n")
-
-            try:
-                if meta.get('tonemapped', False) and self.config['DEFAULT'].get('tonemapped_header', None):
-                    descfile.write(self.config['DEFAULT'].get('tonemapped_header'))
-            except Exception as e:
-                console.print(f"[yellow]Warning: Error setting tonemapped header: {str(e)}[/yellow]")
-
-            bbcode = BBCODE()
-            discs = meta.get('discs', [])
-            filelist = meta.get('filelist', [])
-            desc = base
-            desc = re.sub(r'\[center\]\[spoiler=Scene NFO:\].*?\[/center\]', '', desc, flags=re.DOTALL)
-            if not tracker == "AITHER":
-                desc = re.sub(r'\[center\]\[spoiler=FraMeSToR NFO:\].*?\[/center\]', '', desc, flags=re.DOTALL)
+            # Calculate hash only when hash_is_id is True
+            torrent_hash: Optional[str] = None
+            if hash_is_id:
+                info_data = new_torrent.metainfo.get("info", {})
+                bencode_module = cast(Any, bencodepy)
+                encode = cast(Callable[[Any], bytes], bencode_module.encode)
+                info_bytes = encode(info_data)
+                torrent_hash = hashlib.sha1(
+                    info_bytes, usedforsecurity=False
+                ).hexdigest()  # SHA1 required for torrent info hash
+                new_torrent.metainfo["comment"] = comment + torrent_hash
             else:
-                if "framestor" in meta and meta['framestor']:
-                    desc = re.sub(r'\[center\]\[spoiler=FraMeSToR NFO:\]', '', desc, count=1)
-                    desc = re.sub(r'\[/spoiler\]\[/center\]', '', desc, count=1)
-                    desc = desc.replace("https://i.imgur.com/e9o0zpQ.png", "https://beyondhd.co/images/2017/11/30/c5802892418ee2046efba17166f0cad9.png")
-                    images = []
-            desc = bbcode.convert_pre_to_code(desc)
-            desc = bbcode.convert_hide_to_spoiler(desc)
-            desc = desc.replace("[user]", "").replace("[/user]", "")
-            desc = desc.replace("[hr]", "").replace("[/hr]", "")
-            desc = desc.replace("[ul]", "").replace("[/ul]", "")
-            desc = desc.replace("[ol]", "").replace("[/ol]", "")
-            if comparison is False:
-                desc = bbcode.convert_comparison_to_collapse(desc, 1000)
-            desc = desc.replace('[img]', '[img=300]')
-            descfile.write(desc)
-            # Handle single disc case
-            if len(discs) == 1:
-                each = discs[0]
-                if each['type'] == "DVD":
-                    descfile.write("[center]")
-                    descfile.write(f"[spoiler={os.path.basename(each['vob'])}][code]{each['vob_mi']}[/code][/spoiler]\n\n")
-                    descfile.write("[/center]")
-                if screenheader is not None:
-                    descfile.write(screenheader + '\n')
-                descfile.write("[center]")
-                for img_index in range(len(images[:int(meta['screens'])])):
-                    web_url = images[img_index]['web_url']
-                    raw_url = images[img_index]['raw_url']
-                    descfile.write(f"[url={web_url}][img={self.config['DEFAULT'].get('thumbnail_size', '350')}]{raw_url}[/img][/url] ")
+                new_torrent.metainfo["comment"] = comment
 
-                    # If screensPerRow is set and we have reached that number of screenshots, add a new line
-                    if screensPerRow and (img_index + 1) % screensPerRow == 0:
-                        descfile.write("\n")
-                descfile.write("[/center]")
-                if each['type'] == "BDMV":
-                    bdinfo_keys = [key for key in each if key.startswith("bdinfo")]
-                    if len(bdinfo_keys) > 1:
-                        if 'retry_count' not in meta:
-                            meta['retry_count'] = 0
+            await loop.run_in_executor(None, lambda: Torrent.copy(new_torrent).write(path, overwrite=True))
 
-                        for i, key in enumerate(bdinfo_keys[1:], start=1):  # Skip the first bdinfo
-                            new_images_key = f'new_images_playlist_{i}'
-                            bdinfo = each[key]
-                            edition = bdinfo.get("edition", "Unknown Edition")
+            return torrent_hash
 
-                            # Find the corresponding summary for this bdinfo
-                            summary_key = f"summary_{i}" if i > 0 else "summary"
-                            summary = each.get(summary_key, "No summary available")
+        return None
 
-                            # Check for saved images first
-                            if pack_images_data and 'keys' in pack_images_data and new_images_key in pack_images_data['keys']:
-                                saved_images = pack_images_data['keys'][new_images_key]['images']
-                                if saved_images:
-                                    if meta['debug']:
-                                        console.print(f"[yellow]Using saved images from pack_image_links.json for {new_images_key}")
+    async def get_torrent_hash(self, meta: dict[str, Any], tracker: str) -> str:
+        torrent_path = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}].torrent"
+        async with aiofiles.open(torrent_path, 'rb') as torrent_file:
+            torrent_content = await torrent_file.read()
+            bencode_module = cast(Any, bencodepy)
+            decode = cast(Callable[[bytes], Any], bencode_module.decode)
+            torrent_data = decode(torrent_content)
+            if not isinstance(torrent_data, dict):
+                return ''
+            torrent_dict = cast(dict[bytes, Any], torrent_data)
+            info_value = torrent_dict.get(b'info')
+            if not isinstance(info_value, dict):
+                return ''
+            bencode_module = cast(Any, bencodepy)
+            encode = cast(Callable[[Any], bytes], bencode_module.encode)
+            info = encode(info_value)
+            info_hash = hashlib.sha1(info, usedforsecurity=False).hexdigest()  # SHA1 required for torrent info hash
+        return info_hash
 
-                                    meta[new_images_key] = []
-                                    for img in saved_images:
-                                        meta[new_images_key].append({
-                                            'img_url': img.get('img_url', ''),
-                                            'raw_url': img.get('raw_url', ''),
-                                            'web_url': img.get('web_url', '')
-                                        })
-
-                            if new_images_key in meta and meta[new_images_key]:
-                                descfile.write("[center]\n\n")
-                                # Use the summary corresponding to the current bdinfo
-                                descfile.write(f"[spoiler={edition}][code]{summary}[/code][/spoiler]\n\n")
-                                if meta['debug']:
-                                    console.print("[yellow]Using original uploaded images for first disc")
-                                descfile.write("[center]")
-                                for img in meta[new_images_key]:
-                                    web_url = img['web_url']
-                                    raw_url = img['raw_url']
-                                    image_str = f"[url={web_url}][img={thumb_size}]{raw_url}[/img][/url] "
-                                    descfile.write(image_str)
-                                descfile.write("[/center]\n ")
-                            else:
-                                descfile.write("[center]\n\n")
-                                # Use the summary corresponding to the current bdinfo
-                                descfile.write(f"[spoiler={edition}][code]{summary}[/code][/spoiler]\n\n")
-                                descfile.write("[/center]\n\n")
-                                meta['retry_count'] += 1
-                                meta[new_images_key] = []
-                                new_screens = glob.glob1(f"{meta['base_dir']}/tmp/{meta['uuid']}", f"PLAYLIST_{i}-*.png")
-                                if not new_screens:
-                                    use_vs = meta.get('vapoursynth', False)
-                                    try:
-                                        await disc_screenshots(meta, f"PLAYLIST_{i}", bdinfo, meta['uuid'], meta['base_dir'], use_vs, [], meta.get('ffdebug', False), multi_screens, True)
-                                    except Exception as e:
-                                        print(f"Error during BDMV screenshot capture: {e}")
-                                    new_screens = glob.glob1(f"{meta['base_dir']}/tmp/{meta['uuid']}", f"PLAYLIST_{i}-*.png")
-                                if new_screens and not meta.get('skip_imghost_upload', False):
-                                    uploaded_images, _ = await upload_screens(meta, multi_screens, 1, 0, multi_screens, new_screens, {new_images_key: meta[new_images_key]})
-                                    if uploaded_images and not meta.get('skip_imghost_upload', False):
-                                        await self.save_image_links(meta, new_images_key, uploaded_images)
-                                    for img in uploaded_images:
-                                        meta[new_images_key].append({
-                                            'img_url': img['img_url'],
-                                            'raw_url': img['raw_url'],
-                                            'web_url': img['web_url']
-                                        })
-
-                                    descfile.write("[center]")
-                                    for img in uploaded_images:
-                                        web_url = img['web_url']
-                                        raw_url = img['raw_url']
-                                        image_str = f"[url={web_url}][img={thumb_size}]{raw_url}[/img][/url] "
-                                        descfile.write(image_str)
-                                    descfile.write("[/center]\n")
-
-                                meta_filename = f"{meta['base_dir']}/tmp/{meta['uuid']}/meta.json"
-                                with open(meta_filename, 'w') as f:
-                                    json.dump(meta, f, indent=4)
-
-            # Handle multiple discs case
-            elif len(discs) > 1:
-                # Initialize retry_count if not already set
-                if 'retry_count' not in meta:
-                    meta['retry_count'] = 0
-
-                total_discs_to_process = min(len(discs), process_limit)
-                processed_count = 0
-                if multi_screens != 0:
-                    console.print("[cyan]Processing screenshots for packed content (multiScreens)[/cyan]")
-                    console.print(f"[cyan]{total_discs_to_process} files (processLimit)[/cyan]")
-
-                for i, each in enumerate(discs):
-                    # Set a unique key per disc for managing images
-                    new_images_key = f'new_images_disc_{i}'
-
-                    if i == 0:
-                        descfile.write("[center]")
-                        if each['type'] == "BDMV":
-                            descfile.write(f"{each.get('name', 'BDINFO')}\n\n")
-                        elif each['type'] == "DVD":
-                            descfile.write(f"{each['name']}:\n")
-                            descfile.write(f"[spoiler={os.path.basename(each['vob'])}][code]{each['vob_mi']}[/code][/spoiler]")
-                            descfile.write(f"[spoiler={os.path.basename(each['ifo'])}][code]{each['ifo_mi']}[/code][/spoiler]\n\n")
-                        # For the first disc, use images from `meta['image_list']` and add screenheader if applicable
-                        if meta['debug']:
-                            console.print("[yellow]Using original uploaded images for first disc")
-                        if screenheader is not None:
-                            descfile.write("[/center]\n\n")
-                            descfile.write(screenheader + '\n')
-                            descfile.write("[center]")
-                        for img_index in range(len(images[:int(meta['screens'])])):
-                            web_url = images[img_index]['web_url']
-                            raw_url = images[img_index]['raw_url']
-                            image_str = f"[url={web_url}][img={thumb_size}]{raw_url}[/img][/url] "
-                            descfile.write(image_str)
-
-                            # If screensPerRow is set and we have reached that number of screenshots, add a new line
-                            if screensPerRow and (img_index + 1) % screensPerRow == 0:
-                                descfile.write("\n")
-                        descfile.write("[/center]\n\n")
-                    else:
-                        if multi_screens != 0:
-                            processed_count += 1
-                            disc_name = each.get('name', f"Disc {i}")
-                            print(f"\rProcessing disc {processed_count}/{total_discs_to_process}: {disc_name[:40]}{'...' if len(disc_name) > 40 else ''}", end="", flush=True)
-                            # Check if screenshots exist for the current disc key
-                            # Check for saved images first
-                            if pack_images_data and 'keys' in pack_images_data and new_images_key in pack_images_data['keys']:
-                                saved_images = pack_images_data['keys'][new_images_key]['images']
-                                if saved_images:
-                                    if meta['debug']:
-                                        console.print(f"[yellow]Using saved images from pack_image_links.json for {new_images_key}")
-
-                                    meta[new_images_key] = []
-                                    for img in saved_images:
-                                        meta[new_images_key].append({
-                                            'img_url': img.get('img_url', ''),
-                                            'raw_url': img.get('raw_url', ''),
-                                            'web_url': img.get('web_url', '')
-                                        })
-                            if new_images_key in meta and meta[new_images_key]:
-                                if meta['debug']:
-                                    console.print(f"[yellow]Found needed image URLs for {new_images_key}")
-                                descfile.write("[center]")
-                                if each['type'] == "BDMV":
-                                    descfile.write(f"[spoiler={each.get('name', 'BDINFO')}][code]{each['summary']}[/code][/spoiler]\n\n")
-                                elif each['type'] == "DVD":
-                                    descfile.write(f"{each['name']}:\n")
-                                    descfile.write(f"[spoiler={os.path.basename(each['vob'])}][code]{each['vob_mi']}[/code][/spoiler] ")
-                                    descfile.write(f"[spoiler={os.path.basename(each['ifo'])}][code]{each['ifo_mi']}[/code][/spoiler]\n\n")
-                                descfile.write("[/center]\n\n")
-                                # Use existing URLs from meta to write to descfile
-                                descfile.write("[center]")
-                                for img in meta[new_images_key]:
-                                    web_url = img['web_url']
-                                    raw_url = img['raw_url']
-                                    image_str = f"[url={web_url}][img={thumb_size}]{raw_url}[/img][/url]"
-                                    descfile.write(image_str)
-                                descfile.write("[/center]\n\n")
-                            else:
-                                # Increment retry_count for tracking but use unique disc keys for each disc
-                                meta['retry_count'] += 1
-                                meta[new_images_key] = []
-                                descfile.write("[center]")
-                                if each['type'] == "BDMV":
-                                    descfile.write(f"[spoiler={each.get('name', 'BDINFO')}][code]{each['summary']}[/code][/spoiler]\n\n")
-                                elif each['type'] == "DVD":
-                                    descfile.write(f"{each['name']}:\n")
-                                    descfile.write(f"[spoiler={os.path.basename(each['vob'])}][code]{each['vob_mi']}[/code][/spoiler] ")
-                                    descfile.write(f"[spoiler={os.path.basename(each['ifo'])}][code]{each['ifo_mi']}[/code][/spoiler]\n\n")
-                                descfile.write("[/center]\n\n")
-                                # Check if new screenshots already exist before running prep.screenshots
-                                if each['type'] == "BDMV":
-                                    new_screens = glob.glob1(f"{meta['base_dir']}/tmp/{meta['uuid']}", f"FILE_{i}-*.png")
-                                elif each['type'] == "DVD":
-                                    new_screens = glob.glob1(f"{meta['base_dir']}/tmp/{meta['uuid']}", f"{meta['discs'][i]['name']}-*.png")
-                                if not new_screens:
-                                    if meta['debug']:
-                                        console.print(f"[yellow]No new screens for {new_images_key}; creating new screenshots")
-                                    # Run prep.screenshots if no screenshots are present
-                                    if each['type'] == "BDMV":
-                                        use_vs = meta.get('vapoursynth', False)
-                                        try:
-                                            await disc_screenshots(meta, f"FILE_{i}", each['bdinfo'], meta['uuid'], meta['base_dir'], use_vs, [], meta.get('ffdebug', False), multi_screens, True)
-                                        except Exception as e:
-                                            print(f"Error during BDMV screenshot capture: {e}")
-                                        new_screens = glob.glob1(f"{meta['base_dir']}/tmp/{meta['uuid']}", f"FILE_{i}-*.png")
-                                    if each['type'] == "DVD":
-                                        try:
-                                            await dvd_screenshots(meta, i, multi_screens, True)
-                                        except Exception as e:
-                                            print(f"Error during DVD screenshot capture: {e}")
-                                        new_screens = glob.glob1(f"{meta['base_dir']}/tmp/{meta['uuid']}", f"{meta['discs'][i]['name']}-*.png")
-
-                                if new_screens and not meta.get('skip_imghost_upload', False):
-                                    uploaded_images, _ = await upload_screens(meta, multi_screens, 1, 0, multi_screens, new_screens, {new_images_key: meta[new_images_key]})
-                                    if uploaded_images and not meta.get('skip_imghost_upload', False):
-                                        await self.save_image_links(meta, new_images_key, uploaded_images)
-                                    # Append each uploaded image's data to `meta[new_images_key]`
-                                    for img in uploaded_images:
-                                        meta[new_images_key].append({
-                                            'img_url': img['img_url'],
-                                            'raw_url': img['raw_url'],
-                                            'web_url': img['web_url']
-                                        })
-
-                                    # Write new URLs to descfile
-                                    descfile.write("[center]")
-                                    for img in uploaded_images:
-                                        web_url = img['web_url']
-                                        raw_url = img['raw_url']
-                                        image_str = f"[url={web_url}][img={thumb_size}]{raw_url}[/img][/url] "
-                                        descfile.write(image_str)
-                                    descfile.write("[/center]\n")
-
-                                # Save the updated meta to `meta.json` after upload
-                                meta_filename = f"{meta['base_dir']}/tmp/{meta['uuid']}/meta.json"
-                                with open(meta_filename, 'w') as f:
-                                    json.dump(meta, f, indent=4)
-                            console.print()
-
-            # Handle single file case
-            if len(filelist) == 1:
-                if meta.get('comparison') and meta.get('comparison_groups'):
-                    descfile.write("[center]")
-                    comparison_groups = meta.get('comparison_groups', {})
-                    sorted_group_indices = sorted(comparison_groups.keys(), key=lambda x: int(x))
-
-                    comp_sources = []
-                    for group_idx in sorted_group_indices:
-                        group_data = comparison_groups[group_idx]
-                        group_name = group_data.get('name', f'Group {group_idx}')
-                        comp_sources.append(group_name)
-
-                    sources_string = ", ".join(comp_sources)
-                    descfile.write(f"[comparison={sources_string}]\n")
-
-                    images_per_group = min([
-                        len(comparison_groups[idx].get('urls', []))
-                        for idx in sorted_group_indices
-                    ])
-
-                    for img_idx in range(images_per_group):
-                        for group_idx in sorted_group_indices:
-                            group_data = comparison_groups[group_idx]
-                            urls = group_data.get('urls', [])
-                            if img_idx < len(urls):
-                                img_url = urls[img_idx].get('raw_url', '')
-                                if img_url:
-                                    descfile.write(f"{img_url}\n")
-
-                    descfile.write("[/comparison][/center]\n\n")
-
-                if screenheader is not None:
-                    descfile.write(screenheader + '\n')
-                descfile.write("[center]")
-                for img_index in range(len(images[:int(meta['screens'])])):
-                    web_url = images[img_index]['web_url']
-                    raw_url = images[img_index]['raw_url']
-                    descfile.write(f"[url={web_url}][img={self.config['DEFAULT'].get('thumbnail_size', '350')}]{raw_url}[/img][/url] ")
-                    if screensPerRow and (img_index + 1) % screensPerRow == 0:
-                        descfile.write("\n")
-                descfile.write("[/center]")
-
-            # Handle multiple files case
-            # Initialize character counter
-            char_count = 0
-            max_char_limit = char_limit  # Character limit
-            other_files_spoiler_open = False  # Track if "Other files" spoiler has been opened
-            total_files_to_process = min(len(filelist), process_limit)
-            processed_count = 0
-            if multi_screens != 0 and total_files_to_process > 1:
-                console.print("[cyan]Processing screenshots for packed content (multiScreens)[/cyan]")
-                console.print(f"[cyan]{total_files_to_process} files (processLimit)[/cyan]")
-
-            # First Pass: Create and Upload Images for Each File
-            for i, file in enumerate(filelist):
-                if i >= process_limit:
-                    # console.print("[yellow]Skipping processing more files as they exceed the process limit.")
-                    continue
-                if multi_screens != 0:
-                    if total_files_to_process > 1:
-                        processed_count += 1
-                        filename = os.path.basename(file)
-                        print(f"\rProcessing file {processed_count}/{total_files_to_process}: {filename[:40]}{'...' if len(filename) > 40 else ''}", end="", flush=True)
-                    if i > 0:
-                        new_images_key = f'new_images_file_{i}'
-                        # Check for saved images first
-                        if pack_images_data and 'keys' in pack_images_data and new_images_key in pack_images_data['keys']:
-                            saved_images = pack_images_data['keys'][new_images_key]['images']
-                            if saved_images:
-                                if meta['debug']:
-                                    console.print(f"[yellow]Using saved images from pack_image_links.json for {new_images_key}")
-
-                                meta[new_images_key] = []
-                                for img in saved_images:
-                                    meta[new_images_key].append({
-                                        'img_url': img.get('img_url', ''),
-                                        'raw_url': img.get('raw_url', ''),
-                                        'web_url': img.get('web_url', '')
-                                    })
-                        if new_images_key not in meta or not meta[new_images_key]:
-                            meta[new_images_key] = []
-                            # Proceed with image generation if not already present
-                            new_screens = glob.glob1(f"{meta['base_dir']}/tmp/{meta['uuid']}", f"FILE_{i}-*.png")
-
-                            # If no screenshots exist, create them
-                            if not new_screens:
-                                if meta['debug']:
-                                    console.print(f"[yellow]No existing screenshots for {new_images_key}; generating new ones.")
-                            try:
-                                await screenshots(file, f"FILE_{i}", meta['uuid'], meta['base_dir'], meta, multi_screens, True, None)
-                            except Exception as e:
-                                print(f"Error during generic screenshot capture: {e}")
-
-                            new_screens = glob.glob1(f"{meta['base_dir']}/tmp/{meta['uuid']}", f"FILE_{i}-*.png")
-
-                            # Upload generated screenshots
-                            if new_screens and not meta.get('skip_imghost_upload', False):
-                                uploaded_images, _ = await upload_screens(meta, multi_screens, 1, 0, multi_screens, new_screens, {new_images_key: meta[new_images_key]})
-                                if uploaded_images and not meta.get('skip_imghost_upload', False):
-                                    await self.save_image_links(meta, new_images_key, uploaded_images)
-                                for img in uploaded_images:
-                                    meta[new_images_key].append({
-                                        'img_url': img['img_url'],
-                                        'raw_url': img['raw_url'],
-                                        'web_url': img['web_url']
-                                    })
-
-            # Save updated meta
-            meta_filename = f"{meta['base_dir']}/tmp/{meta['uuid']}/meta.json"
-            with open(meta_filename, 'w') as f:
-                json.dump(meta, f, indent=4)
-
-            # Second Pass: Process MediaInfo and Write Descriptions
-            if len(filelist) > 1:
-                for i, file in enumerate(filelist):
-                    if i >= process_limit:
-                        continue
-                    # Extract filename directly from the file path
-                    filename = os.path.splitext(os.path.basename(file.strip()))[0].replace('[', '').replace(']', '')
-
-                    # If we are beyond the file limit, add all further files in a spoiler
-                    if multi_screens != 0:
-                        if i >= file_limit:
-                            if not other_files_spoiler_open:
-                                descfile.write("[center][spoiler=Other files]\n")
-                                char_count += len("[center][spoiler=Other files]\n")
-                                other_files_spoiler_open = True
-
-                    # Write filename in BBCode format with MediaInfo in spoiler if not the first file
-                    if multi_screens != 0:
-                        if i > 0 and char_count < max_char_limit:
-                            mi_dump = MediaInfo.parse(file, output="STRING", full=False, mediainfo_options={'inform_version': '1'})
-                            parsed_mediainfo = self.parser.parse_mediainfo(mi_dump)
-                            formatted_bbcode = self.parser.format_bbcode(parsed_mediainfo)
-                            descfile.write(f"[center][spoiler={filename}]{formatted_bbcode}[/spoiler][/center]\n")
-                            char_count += len(f"[center][spoiler={filename}]{formatted_bbcode}[/spoiler][/center]\n")
-                        else:
-                            # If there are screen shots and screen shot header, write the header above the first filename
-                            if i == 0 and images and screenheader is not None:
-                                descfile.write(screenheader + '\n')
-                                char_count += len(screenheader + '\n')
-                            descfile.write(f"[center]{filename}\n[/center]\n")
-                            char_count += len(f"[center]{filename}\n[/center]\n")
-
-                    # Write images if they exist
-                    new_images_key = f'new_images_file_{i}'
-                    if i == 0:  # For the first file, use 'image_list' key and add screenheader if applicable
-                        if images:
-                            descfile.write("[center]")
-                            char_count += len("[center]")
-                            for img_index in range(len(images)):
-                                web_url = images[img_index]['web_url']
-                                raw_url = images[img_index]['raw_url']
-                                image_str = f"[url={web_url}][img={thumb_size}]{raw_url}[/img][/url] "
-                                descfile.write(image_str)
-                                char_count += len(image_str)
-
-                                # If screensPerRow is set and we have reached that number of screenshots, add a new line
-                                if screensPerRow and (img_index + 1) % screensPerRow == 0:
-                                    descfile.write("\n")
-                            descfile.write("[/center]\n\n")
-                            char_count += len("[/center]\n\n")
-                    elif multi_screens != 0:
-                        if new_images_key in meta and meta[new_images_key]:
-                            descfile.write("[center]")
-                            char_count += len("[center]")
-                            for img in meta[new_images_key]:
-                                web_url = img['web_url']
-                                raw_url = img['raw_url']
-                                image_str = f"[url={web_url}][img={thumb_size}]{raw_url}[/img][/url] "
-                                descfile.write(image_str)
-                                char_count += len(image_str)
-                            descfile.write("[/center]\n")
-                            char_count += len("[/center]\n\n")
-
-                if other_files_spoiler_open:
-                    descfile.write("[/spoiler][/center]\n")
-                    char_count += len("[/spoiler][/center]\n")
-
-            if char_count >= 1 and meta['debug']:
-                console.print(f"[yellow]Total characters written to description: {char_count}")
-            if total_files_to_process > 1:
-                console.print()
-
-            # Append signature if provided
-            if signature:
-                descfile.write(signature)
-            descfile.close()
-        return
-
-    async def save_image_links(self, meta, image_key, image_list=None):
+    async def save_image_links(self, meta: dict[str, Any], image_key: str, image_list: Optional[list[dict[str, str]]]) -> Optional[str]:
         if image_list is None:
             console.print("[yellow]No image links to save.[/yellow]")
             return None
@@ -640,45 +194,77 @@ class COMMON():
         output_file = os.path.join(output_dir, "pack_image_links.json")
 
         # Load existing data if the file exists
-        existing_data = {}
+        existing_data: dict[str, Any] = {}
         if os.path.exists(output_file):
             try:
-                with open(output_file, 'r', encoding='utf-8') as f:
-                    existing_data = json.load(f)
-            except Exception as e:
+                async with aiofiles.open(output_file, encoding='utf-8') as f:
+                    content = await f.read()
+                    loaded_data: dict[str, Any] = {}
+                    if content.strip():
+                        parsed = json.loads(content)
+                        if isinstance(parsed, dict):
+                            loaded_data = cast(dict[str, Any], parsed)
+                        else:
+                            console.print("[yellow]Warning: Existing image data has invalid schema, reinitializing.[/yellow]")
+
+                    # Validate schema: must have 'keys' as dict and 'total_count' as int
+                    if (
+                        isinstance(loaded_data.get('keys'), dict)
+                        and isinstance(loaded_data.get('total_count'), int)
+                    ):
+                        existing_data = loaded_data
+            except (json.JSONDecodeError, OSError) as e:
                 console.print(f"[yellow]Warning: Could not load existing image data: {str(e)}[/yellow]")
 
-        # Create data structure if it doesn't exist yet
+        # Create data structure if it doesn't exist or was invalid
         if not existing_data:
             existing_data = {
                 "keys": {},
                 "total_count": 0
             }
 
-        # Update the data with the new images under the specific key
-        if image_key not in existing_data["keys"]:
-            existing_data["keys"][image_key] = {
+        # Ensure 'keys' is a dict (extra safety)
+        keys_data: dict[str, dict[str, Any]] = {}
+        keys_raw = existing_data.get('keys')
+        if isinstance(keys_raw, dict):
+            keys_data = cast(dict[str, dict[str, Any]], keys_raw)
+        else:
+            existing_data['keys'] = keys_data
+
+        if image_key not in keys_data or not isinstance(keys_data.get(image_key), dict):
+            keys_data[image_key] = {
                 "count": 0,
                 "images": []
             }
+        key_entry = keys_data[image_key]
+        images_list: list[dict[str, Any]] = []
+        if isinstance(key_entry.get("images"), list):
+            images_list = cast(list[dict[str, Any]], key_entry["images"])
+        else:
+            key_entry["images"] = images_list
 
         # Add new images to the specific key
         for idx, img in enumerate(image_list):
-            image_entry = {
-                "index": existing_data["keys"][image_key]["count"] + idx,
+            image_entry: dict[str, Any] = {
+                "index": key_entry["count"] + idx,
                 "raw_url": img.get("raw_url", ""),
                 "web_url": img.get("web_url", ""),
                 "img_url": img.get("img_url", ""),
             }
-            existing_data["keys"][image_key]["images"].append(image_entry)
+            images_list.append(image_entry)
 
         # Update counts
-        existing_data["keys"][image_key]["count"] = len(existing_data["keys"][image_key]["images"])
-        existing_data["total_count"] = sum(key_data["count"] for key_data in existing_data["keys"].values())
+        key_entry["count"] = len(images_list)
+        # Safely compute total_count, handling any malformed per-key entries
+        total = 0
+        for key_data in keys_data.values():
+            if isinstance(key_data.get("count"), int):
+                total += key_data["count"]
+        existing_data["total_count"] = total
 
         try:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(existing_data, f, indent=2)
+            async with aiofiles.open(output_file, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(existing_data, indent=2))
 
             if meta['debug']:
                 console.print(f"[green]Saved {len(image_list)} new images for key '{image_key}' (total: {existing_data['total_count']}):[/green]")
@@ -689,7 +275,7 @@ class COMMON():
             console.print(f"[bold red]Error saving image links: {e}[/bold red]")
             return None
 
-    async def unit3d_region_ids(self, region, reverse=False, region_id=None):
+    async def unit3d_region_ids(self, region: str = "", reverse: bool = False, region_id: int = 0) -> str:
         region_map = {
             'AFG': 1, 'AIA': 2, 'ALA': 3, 'ALG': 4, 'AND': 5, 'ANG': 6, 'ARG': 7, 'ARM': 8, 'ARU': 9,
             'ASA': 10, 'ATA': 11, 'ATF': 12, 'ATG': 13, 'AUS': 14, 'AUT': 15, 'AZE': 16, 'BAH': 17,
@@ -726,15 +312,21 @@ class COMMON():
 
         if reverse:
             # Reverse lookup: Find region code by ID
+            # Convert to int to handle cases where API returns string
+            try:
+                region_id = int(region_id)
+            except (ValueError, TypeError):
+                return ""
             for code, id_value in region_map.items():
                 if id_value == region_id:
                     return code
-            return None
+            return ""
         else:
             # Forward lookup: Find region ID by code
-            return region_map.get(region, 0)
+            region_id_value = region_map.get(region)
+            return str(region_id_value) if region_id_value else ""
 
-    async def unit3d_distributor_ids(self, distributor, reverse=False, distributor_id=None):
+    async def unit3d_distributor_ids(self, distributor: str = "", reverse: bool = False, distributor_id: int = 0) -> str:
         distributor_map = {
             '01 DISTRIBUTION': 1, '100 DESTINATIONS TRAVEL FILM': 2, '101 FILMS': 3, '1FILMS': 4, '2 ENTERTAIN VIDEO': 5, '20TH CENTURY FOX': 6, '2L': 7, '3D CONTENT HUB': 8, '3D MEDIA': 9, '3L FILM': 10, '4DIGITAL': 11, '4DVD': 12, '4K ULTRA HD MOVIES': 13, '4K UHD': 13, '8-FILMS': 14, '84 ENTERTAINMENT': 15, '88 FILMS': 16, '@ANIME': 17, 'ANIME': 17, 'A CONTRACORRIENTE': 18, 'A CONTRACORRIENTE FILMS': 19, 'A&E HOME VIDEO': 20, 'A&E': 20, 'A&M RECORDS': 21, 'A+E NETWORKS': 22, 'A+R': 23, 'A-FILM': 24, 'AAA': 25, 'AB VIDÉO': 26, 'AB VIDEO': 26, 'ABC - (AUSTRALIAN BROADCASTING CORPORATION)': 27, 'ABC': 27, 'ABKCO': 28, 'ABSOLUT MEDIEN': 29, 'ABSOLUTE': 30, 'ACCENT FILM ENTERTAINMENT': 31, 'ACCENTUS': 32, 'ACORN MEDIA': 33, 'AD VITAM': 34, 'ADA': 35, 'ADITYA VIDEOS': 36, 'ADSO FILMS': 37, 'AFM RECORDS': 38, 'AGFA': 39, 'AIX RECORDS': 40, 'ALAMODE FILM': 41, 'ALBA RECORDS': 42, 'ALBANY RECORDS': 43, 'ALBATROS': 44, 'ALCHEMY': 45, 'ALIVE': 46, 'ALL ANIME': 47, 'ALL INTERACTIVE ENTERTAINMENT': 48, 'ALLEGRO': 49, 'ALLIANCE': 50, 'ALPHA MUSIC': 51, 'ALTERDYSTRYBUCJA': 52, 'ALTERED INNOCENCE': 53, 'ALTITUDE FILM DISTRIBUTION': 54, 'ALUCARD RECORDS': 55, 'AMAZING D.C.': 56, 'AMAZING DC': 56, 'AMMO CONTENT': 57, 'AMUSE SOFT ENTERTAINMENT': 58, 'ANCONNECT': 59, 'ANEC': 60, 'ANIMATSU': 61, 'ANIME HOUSE': 62, 'ANIME LTD': 63, 'ANIME WORKS': 64, 'ANIMEIGO': 65, 'ANIPLEX': 66, 'ANOLIS ENTERTAINMENT': 67, 'ANOTHER WORLD ENTERTAINMENT': 68, 'AP INTERNATIONAL': 69, 'APPLE': 70, 'ARA MEDIA': 71, 'ARBELOS': 72, 'ARC ENTERTAINMENT': 73, 'ARP SÉLECTION': 74, 'ARP SELECTION': 74, 'ARROW': 75, 'ART SERVICE': 76, 'ART VISION': 77, 'ARTE ÉDITIONS': 78, 'ARTE EDITIONS': 78, 'ARTE VIDÉO': 79, 'ARTE VIDEO': 79, 'ARTHAUS MUSIK': 80, 'ARTIFICIAL EYE': 81, 'ARTSPLOITATION FILMS': 82, 'ARTUS FILMS': 83, 'ASCOT ELITE HOME ENTERTAINMENT': 84, 'ASIA VIDEO': 85, 'ASMIK ACE': 86, 'ASTRO RECORDS & FILMWORKS': 87, 'ASYLUM': 88, 'ATLANTIC FILM': 89, 'ATLANTIC RECORDS': 90, 'ATLAS FILM': 91, 'AUDIO VISUAL ENTERTAINMENT': 92, 'AURO-3D CREATIVE LABEL': 93, 'AURUM': 94, 'AV VISIONEN': 95, 'AV-JET': 96, 'AVALON': 97, 'AVENTI': 98, 'AVEX TRAX': 99, 'AXIOM': 100, 'AXIS RECORDS': 101, 'AYNGARAN': 102, 'BAC FILMS': 103, 'BACH FILMS': 104, 'BANDAI VISUAL': 105, 'BARCLAY': 106, 'BBC': 107, 'BRITISH BROADCASTING CORPORATION': 107, 'BBI FILMS': 108, 'BBI': 108, 'BCI HOME ENTERTAINMENT': 109, 'BEGGARS BANQUET': 110, 'BEL AIR CLASSIQUES': 111, 'BELGA FILMS': 112, 'BELVEDERE': 113, 'BENELUX FILM DISTRIBUTORS': 114, 'BENNETT-WATT MEDIA': 115, 'BERLIN CLASSICS': 116, 'BERLINER PHILHARMONIKER RECORDINGS': 117, 'BEST ENTERTAINMENT': 118, 'BEYOND HOME ENTERTAINMENT': 119, 'BFI VIDEO': 120, 'BFI': 120, 'BRITISH FILM INSTITUTE': 120, 'BFS ENTERTAINMENT': 121, 'BFS': 121, 'BHAVANI': 122, 'BIBER RECORDS': 123, 'BIG HOME VIDEO': 124, 'BILDSTÖRUNG': 125, 'BILDSTORUNG': 125, 'BILL ZEBUB': 126, 'BIRNENBLATT': 127, 'BIT WEL': 128, 'BLACK BOX': 129, 'BLACK HILL PICTURES': 130, 'BLACK HILL': 130, 'BLACK HOLE RECORDINGS': 131, 'BLACK HOLE': 131, 'BLAQOUT': 132, 'BLAUFIELD MUSIC': 133, 'BLAUFIELD': 133, 'BLOCKBUSTER ENTERTAINMENT': 134, 'BLOCKBUSTER': 134, 'BLU PHASE MEDIA': 135, 'BLU-RAY ONLY': 136, 'BLU-RAY': 136, 'BLURAY ONLY': 136, 'BLURAY': 136, 'BLUE GENTIAN RECORDS': 137, 'BLUE KINO': 138, 'BLUE UNDERGROUND': 139, 'BMG/ARISTA': 140, 'BMG': 140, 'BMGARISTA': 140, 'BMG ARISTA': 140, 'ARISTA':
             140, 'ARISTA/BMG': 140, 'ARISTABMG': 140, 'ARISTA BMG': 140, 'BONTON FILM': 141, 'BONTON': 141, 'BOOMERANG PICTURES': 142, 'BOOMERANG': 142, 'BQHL ÉDITIONS': 143, 'BQHL EDITIONS': 143, 'BQHL': 143, 'BREAKING GLASS': 144, 'BRIDGESTONE': 145, 'BRINK': 146, 'BROAD GREEN PICTURES': 147, 'BROAD GREEN': 147, 'BUSCH MEDIA GROUP': 148, 'BUSCH': 148, 'C MAJOR': 149, 'C.B.S.': 150, 'CAICHANG': 151, 'CALIFÓRNIA FILMES': 152, 'CALIFORNIA FILMES': 152, 'CALIFORNIA': 152, 'CAMEO': 153, 'CAMERA OBSCURA': 154, 'CAMERATA': 155, 'CAMP MOTION PICTURES': 156, 'CAMP MOTION': 156, 'CAPELIGHT PICTURES': 157, 'CAPELIGHT': 157, 'CAPITOL': 159, 'CAPITOL RECORDS': 159, 'CAPRICCI': 160, 'CARGO RECORDS': 161, 'CARLOTTA FILMS': 162, 'CARLOTTA': 162, 'CARLOTA': 162, 'CARMEN FILM': 163, 'CASCADE': 164, 'CATCHPLAY': 165, 'CAULDRON FILMS': 166, 'CAULDRON': 166, 'CBS TELEVISION STUDIOS': 167, 'CBS': 167, 'CCTV': 168, 'CCV ENTERTAINMENT': 169, 'CCV': 169, 'CD BABY': 170, 'CD LAND': 171, 'CECCHI GORI': 172, 'CENTURY MEDIA': 173, 'CHUAN XUN SHI DAI MULTIMEDIA': 174, 'CINE-ASIA': 175, 'CINÉART': 176, 'CINEART': 176, 'CINEDIGM': 177, 'CINEFIL IMAGICA': 178, 'CINEMA EPOCH': 179, 'CINEMA GUILD': 180, 'CINEMA LIBRE STUDIOS': 181, 'CINEMA MONDO': 182, 'CINEMATIC VISION': 183, 'CINEPLOIT RECORDS': 184, 'CINESTRANGE EXTREME': 185, 'CITEL VIDEO': 186, 'CITEL': 186, 'CJ ENTERTAINMENT': 187, 'CJ': 187, 'CLASSIC MEDIA': 188, 'CLASSICFLIX': 189, 'CLASSICLINE': 190, 'CLAUDIO RECORDS': 191, 'CLEAR VISION': 192, 'CLEOPATRA': 193, 'CLOSE UP': 194, 'CMS MEDIA LIMITED': 195, 'CMV LASERVISION': 196, 'CN ENTERTAINMENT': 197, 'CODE RED': 198, 'COHEN MEDIA GROUP': 199, 'COHEN': 199, 'COIN DE MIRE CINÉMA': 200, 'COIN DE MIRE CINEMA': 200, 'COLOSSEO FILM': 201, 'COLUMBIA': 203, 'COLUMBIA PICTURES': 203, 'COLUMBIA/TRI-STAR': 204, 'TRI-STAR': 204, 'COMMERCIAL MARKETING': 205, 'CONCORD MUSIC GROUP': 206, 'CONCORDE VIDEO': 207, 'CONDOR': 208, 'CONSTANTIN FILM': 209, 'CONSTANTIN': 209, 'CONSTANTINO FILMES': 210, 'CONSTANTINO': 210, 'CONSTRUCTIVE MEDIA SERVICE': 211, 'CONSTRUCTIVE': 211, 'CONTENT ZONE': 212, 'CONTENTS GATE': 213, 'COQUEIRO VERDE': 214, 'CORNERSTONE MEDIA': 215, 'CORNERSTONE': 215, 'CP DIGITAL': 216, 'CREST MOVIES': 217, 'CRITERION': 218, 'CRITERION COLLECTION':
@@ -760,14 +352,29 @@ class COMMON():
         }
 
         if reverse:
+            # Convert to int to handle cases where API returns string
+            try:
+                distributor_id = int(distributor_id)
+            except (ValueError, TypeError):
+                return ""
             for name, id_value in distributor_map.items():
                 if id_value == distributor_id:
                     return name
-            return None
+            return ""
         else:
-            return distributor_map.get(distributor, 0)
+            distributor_id_value = distributor_map.get(distributor)
+            return str(distributor_id_value) if distributor_id_value else ""
 
-    async def prompt_user_for_id_selection(self, meta, tmdb=None, imdb=None, tvdb=None, mal=None, filename=None, tracker_name=None):
+    async def prompt_user_for_id_selection(
+        self,
+        meta: dict[str, Any],
+        tmdb: Optional[Union[str, int]] = None,
+        imdb: Optional[Union[str, int]] = None,
+        tvdb: Optional[Union[str, int]] = None,
+        mal: Optional[Union[str, int]] = None,
+        filename: Optional[Union[str, list[str]]] = None,
+        tracker_name: Optional[str] = None,
+    ) -> bool:
         if not tracker_name:
             tracker_name = "Tracker"  # Fallback if tracker_name is not provided
 
@@ -792,40 +399,41 @@ class COMMON():
         if not meta['unattended']:
             selection = input(f"Do you want to use these IDs from {tracker_name}? (Y/n): ").strip().lower()
             try:
-                if selection == '' or selection == 'y' or selection == 'yes':
-                    return True
-                else:
-                    return False
+                return bool(selection == '' or selection == 'y' or selection == 'yes')
             except (KeyboardInterrupt, EOFError):
                 sys.exit(1)
         else:
             return True
 
-    async def prompt_user_for_confirmation(self, message):
+    async def prompt_user_for_confirmation(self, message: str) -> bool:
         response = input(f"{message} (Y/n): ").strip().lower()
-        if response == '' or response == 'y':
-            return True
-        return False
+        return bool(response == '' or response == 'y')
 
-    async def unit3d_region_distributor(self, meta, tracker, torrent_url, id=None):
+    async def unit3d_region_distributor(self, meta: dict[str, Any], tracker: str, torrent_url: str, id: str = "") -> None:
         """Get region and distributor information from API response"""
-        params = {'api_token': self.config['TRACKERS'][tracker].get('api_key', '')}
+        raw_api_key = self.config['TRACKERS'][tracker].get('api_key')
+        api_key = str(raw_api_key).strip() if raw_api_key else ''
+        params: dict[str, str] = {'api_token': api_key}
         url = f"{torrent_url}{id}"
-        response = requests.get(url=url, params=params)
         try:
-            json_response = response.json()
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url=url, params=params)
+                json_response = response.json()
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            console.print(f"[yellow]Request error in unit3d_region_distributor: {e}[/yellow]")
+            return
         except ValueError:
             return
         try:
-            data = json_response.get('data', [])
+            data: Union[list[dict[str, Any]], str] = json_response.get('data', [])
             if data == "404":
                 console.print("[yellow]No data found (404). Returning None.[/yellow]")
                 return
             if data and isinstance(data, list):
                 attributes = data[0].get('attributes', {})
 
-                region_id = attributes.get('region_id')
-                distributor_id = attributes.get('distributor_id')
+                region_id = attributes.get('region_id', 0)
+                distributor_id = attributes.get('distributor_id', 0)
 
                 if meta['debug']:
                     console.print(f"[blue]Region ID: {region_id}[/blue]")
@@ -833,7 +441,7 @@ class COMMON():
 
                 # use reverse to reverse map the id to the name
                 if not meta.get('region') and region_id:
-                    region_name = await self.unit3d_region_ids(None, reverse=True, region_id=region_id)
+                    region_name = await self.unit3d_region_ids(reverse=True, region_id=region_id)
                     if region_name:
                         meta['region'] = region_name
                         if meta['debug']:
@@ -841,7 +449,7 @@ class COMMON():
 
                 # use reverse to reverse map the id to the name
                 if not meta.get('distributor') and distributor_id:
-                    distributor_name = await self.unit3d_distributor_ids(None, reverse=True, distributor_id=distributor_id)
+                    distributor_name = await self.unit3d_distributor_ids(reverse=True, distributor_id=distributor_id)
                     if distributor_name:
                         meta['distributor'] = distributor_name
                         if meta['debug']:
@@ -860,14 +468,14 @@ class COMMON():
                         console.print(f"[blue]Distributor ID: {distributor_id}[/blue]")
 
                     if not meta.get('region') and region_id:
-                        region_name = await self.unit3d_region_ids(None, reverse=True, region_id=region_id)
+                        region_name = await self.unit3d_region_ids(reverse=True, region_id=region_id)
                         if region_name:
                             meta['region'] = region_name
                             if meta['debug']:
                                 console.print(f"[green]Mapped region_id {region_id} to '{region_name}'[/green]")
 
                     if not meta.get('distributor') and distributor_id:
-                        distributor_name = await self.unit3d_distributor_ids(None, reverse=True, distributor_id=distributor_id)
+                        distributor_name = await self.unit3d_distributor_ids(reverse=True, distributor_id=distributor_id)
                         if distributor_name:
                             meta['distributor'] = distributor_name
                             if meta['debug']:
@@ -877,12 +485,33 @@ class COMMON():
             console.print(f"[yellow]Invalid Response from {tracker} API. Error: {str(e)}[/yellow]")
             return
 
-    async def unit3d_torrent_info(self, tracker, torrent_url, search_url, meta, id=None, file_name=None, only_id=False):
+    async def unit3d_torrent_info(
+        self,
+        tracker: str,
+        torrent_url: str,
+        search_url: str,
+        meta: dict[str, Any],
+        id: Optional[Union[str, int]] = None,
+        file_name: Optional[Union[str, list[str]]] = None,
+        only_id: bool = False,
+    ) -> tuple[
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        Optional[int],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        list[dict[str, str]],
+        Optional[Union[str, list[str]]],
+    ]:
         tmdb = imdb = tvdb = description = category = infohash = mal = files = None  # noqa F841
-        imagelist = []
+        imagelist: list[dict[str, str]] = []
 
         # Build the params for the API request
-        params = {'api_token': self.config['TRACKERS'][tracker].get('api_key', '')}
+        raw_api_key = self.config['TRACKERS'][tracker].get('api_key')
+        api_key = str(raw_api_key).strip() if raw_api_key else ''
+        params: dict[str, Any] = {'api_token': api_key}
 
         # Determine the search method and add parameters accordingly
         if file_name:
@@ -897,26 +526,25 @@ class COMMON():
         else:
             if meta.get('debug'):
                 console.print("[red]No ID or file name provided for search.[/red]")
-            return None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, [], None
 
         # Make the GET request with proper encoding handled by 'params'
-        response = requests.get(url=url, params=params)
-        # console.print(f"[blue]Raw API Response: {response}[/blue]")
-
         try:
-            json_response = response.json()
-
-            # console.print(f"Raw API Response: {json_response}", markup=False)
-
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url=url, params=params)
+                json_response = response.json()
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            console.print(f"[yellow]Request error in unit3d_torrent_info: {e}[/yellow]")
+            return None, None, None, None, None, None, None, [], None
         except ValueError:
-            return None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, [], None
 
         try:
             # Handle response when searching by file name (which might return a 'data' array)
-            data = json_response.get('data', [])
+            data: Union[list[dict[str, Any]], str] = json_response.get('data', [])
             if data == "404":
                 console.print("[yellow]No data found (404). Returning None.[/yellow]")
-                return None, None, None, None, None, None, None, None, None
+                return None, None, None, None, None, None, None, [], None
 
             if data and isinstance(data, list):  # Ensure data is a list before accessing it
                 attributes = data[0].get('attributes', {})
@@ -935,12 +563,12 @@ class COMMON():
                 imdb = 0 if imdb == 0 else imdb
                 if not meta.get('region') and meta.get('is_disc') == "BDMV":
                     region_id = attributes.get('region_id')
-                    region_name = await self.unit3d_region_ids(None, reverse=True, region_id=region_id)
+                    region_name = await self.unit3d_region_ids(reverse=True, region_id=region_id)
                     if region_name:
                         meta['region'] = region_name
                 if not meta.get('distributor') and meta.get('is_disc') == "BDMV":
                     distributor_id = attributes.get('distributor_id')
-                    distributor_name = await self.unit3d_distributor_ids(None, reverse=True, distributor_id=distributor_id)
+                    distributor_name = await self.unit3d_distributor_ids(reverse=True, distributor_id=distributor_id)
                     if distributor_name:
                         meta['distributor'] = distributor_name
             else:
@@ -962,41 +590,30 @@ class COMMON():
                     imdb = 0 if imdb == 0 else imdb
                     if not meta.get('region') and meta.get('is_disc') == "BDMV":
                         region_id = attributes.get('region_id')
-                        region_name = await self.unit3d_region_ids(None, reverse=True, region_id=region_id)
+                        region_name = await self.unit3d_region_ids(reverse=True, region_id=region_id)
                         if region_name:
                             meta['region'] = region_name
                     if not meta.get('distributor') and meta.get('is_disc') == "BDMV":
                         distributor_id = attributes.get('distributor_id')
-                        distributor_name = await self.unit3d_distributor_ids(None, reverse=True, distributor_id=distributor_id)
+                        distributor_name = await self.unit3d_distributor_ids(reverse=True, distributor_id=distributor_id)
                         if distributor_name:
                             meta['distributor'] = distributor_name
                     # Handle file name extraction
                     files = attributes.get('files', [])
                     if files:
-                        if len(files) == 1:
-                            file_name = files[0]['name']
-                        else:
-                            file_name = [file['name'] for file in files[:5]]  # Return up to 5 filenames
+                        file_name = files[0]['name'] if len(files) == 1 else [file['name'] for file in files[:5]]
 
                     if meta.get('debug'):
                         console.print(f"[blue]Extracted filename(s): {file_name}[/blue]")  # Print the extracted filename(s)
 
-                    if imdb != 0:
-                        imdb_str = str(f'tt{imdb}').zfill(7)
-                    else:
-                        imdb_str = None
-
-                    console.print(f"[green]Valid IDs found from {tracker}: TMDb: {tmdb}, IMDb: {imdb_str}, TVDb: {tvdb}, MAL: {mal}[/green]")
-
-            if tmdb or imdb or tvdb:
-                if not id:
-                    # Only prompt the user for ID selection if not searching by ID
-                    try:
-                        if not await self.prompt_user_for_id_selection(meta, tmdb, imdb, tvdb, mal, file_name, tracker_name=tracker):
-                            console.print("[yellow]User chose to skip based on IDs.[/yellow]")
-                            return None, None, None, None, None, None, None, None, None
-                    except (KeyboardInterrupt, EOFError):
-                        sys.exit(1)
+            if (tmdb or imdb or tvdb) and not id:
+                # Only prompt the user for ID selection if not searching by ID
+                try:
+                    if not await self.prompt_user_for_id_selection(meta, tmdb, imdb, tvdb, mal, file_name, tracker_name=tracker):
+                        console.print("[yellow]User chose to skip based on IDs.[/yellow]")
+                        return None, None, None, None, None, None, None, [], None
+                except (KeyboardInterrupt, EOFError):
+                    sys.exit(1)
 
             if description:
                 bbcode = BBCODE()
@@ -1006,26 +623,20 @@ class COMMON():
                     console.print(f"Extracted description: {description}", markup=False)
 
                     if meta.get('unattended') or (meta.get('blu') or meta.get('aither') or meta.get('lst') or meta.get('oe') or meta.get('huno') or meta.get('ulcx')):
-                        meta['description'] = description
-                        meta['saved_description'] = True
+                        return tmdb, imdb, tvdb, mal, description, category, infohash, imagelist, file_name
                     else:
                         console.print("[cyan]Do you want to edit, discard or keep the description?[/cyan]")
-                        edit_choice = input("Enter 'e' to edit, 'd' to discard, or press Enter to keep it as is:")
+                        edit_choice = cli_ui.ask_string("Enter 'e' to edit, 'd' to discard, or press Enter to keep it as is:")
 
-                        if edit_choice.lower() == 'e':
+                        if (edit_choice or "").lower() == 'e':
                             edited_description = click.edit(description)
                             if edited_description:
                                 description = edited_description.strip()
-                            meta['description'] = description
-                            meta['saved_description'] = True
-                        elif edit_choice.lower() == 'd':
+                        elif (edit_choice or "").lower() == 'd':
                             description = None
-                            imagelist = []
                             console.print("[yellow]Description discarded.[/yellow]")
                         else:
                             console.print("[green]Keeping the original description.[/green]")
-                            meta['description'] = description
-                            meta['saved_description'] = True
                     if not meta.get('keep_images'):
                         imagelist = []
                 else:
@@ -1038,70 +649,93 @@ class COMMON():
         except Exception as e:
             console.print_exception()
             console.print(f"[yellow]Invalid Response from {tracker} API. Error: {str(e)}[/yellow]")
-            return None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, [], None
 
-    async def parseCookieFile(self, cookiefile):
+    async def parseCookieFile(self, cookiefile: str) -> dict[str, str]:
         """Parse a cookies.txt file and return a dictionary of key value pairs
         compatible with requests."""
 
-        cookies = {}
-        with open(cookiefile, 'r') as fp:
-            for line in fp:
-                if not line.startswith(("# ", "\n", "#\n")):
+        cookies: dict[str, str] = {}
+        async with aiofiles.open(cookiefile) as fp:
+            content = await fp.read()
+            for line in content.splitlines():
+                if line.strip() and not line.startswith(("# ", "#")):
                     lineFields = re.split(' |\t', line.strip())
                     lineFields = [x for x in lineFields if x != ""]
-                    cookies[lineFields[5]] = lineFields[6]
+                    if len(lineFields) >= 7:
+                        cookies[lineFields[5]] = lineFields[6]
         return cookies
 
-    async def ptgen(self, meta, ptgen_site="", ptgen_retry=3):
-        ptgen = ""
+    async def ptgen(self, meta: dict[str, Any], ptgen_site: str = "", ptgen_retry: int = 3) -> str:
+        ptgen_text = ""
         url = 'https://ptgen.zhenzhen.workers.dev'
         if ptgen_site != '':
             url = ptgen_site
-        params = {}
-        data = {}
-        # get douban url
-        if int(meta.get('imdb_id')) != 0:
-            data['search'] = f"tt{meta['imdb_id']}"
-            ptgen = requests.get(url, params=data)
-            if ptgen.json()["error"] is not None:
-                for retry in range(ptgen_retry):
-                    try:
-                        ptgen = requests.get(url, params=params)
-                        if ptgen.json()["error"] is None:
-                            break
-                    except requests.exceptions.JSONDecodeError:
-                        continue
+        params: dict[str, Any] = {}
+        data: dict[str, Any] = {}
+
+        async def fetch_ptgen(client: httpx.AsyncClient, request_url: str, request_params: dict[str, Any]) -> Optional[dict[str, Any]]:
+            """Helper to fetch and parse ptgen response with error handling."""
             try:
-                params['url'] = ptgen.json()['data'][0]['link']
-            except Exception:
-                console.print("[red]Unable to get data from ptgen using IMDb")
-                params['url'] = console.input("[red]Please enter [yellow]Douban[/yellow] link: ")
-        else:
-            console.print("[red]No IMDb id was found.")
-            params['url'] = console.input("[red]Please enter [yellow]Douban[/yellow] link: ")
+                response = await client.get(request_url, params=request_params, timeout=30.0)
+                json_data: dict[str, Any] = response.json()
+                return json_data
+            except (httpx.RequestError, httpx.TimeoutException, ValueError):
+                return None
+
         try:
-            ptgen = requests.get(url, params=params)
-            if ptgen.json()["error"] is not None:
-                for retry in range(ptgen_retry):
-                    ptgen = requests.get(url, params=params)
-                    if ptgen.json()["error"] is None:
-                        break
-            ptgen = ptgen.json()
-            meta['ptgen'] = ptgen
-            with open(f"{meta['base_dir']}/tmp/{meta['uuid']}/meta.json", 'w') as f:
-                json.dump(meta, f, indent=4)
-                f.close()
-            ptgen = ptgen['format']
-            if "[/img]" in ptgen:
-                ptgen = ptgen.split("[/img]")[1]
-            ptgen = f"[img]{meta.get('imdb_info', {}).get('cover', meta.get('cover', ''))}[/img]{ptgen}"
+            async with httpx.AsyncClient() as client:
+                # get douban url
+                if int(meta.get('imdb_id', 0)) != 0:
+                    data['search'] = f"tt{meta['imdb_id']}"
+                    ptgen_json = await fetch_ptgen(client, url, data)
+
+                    # Check for error and retry if needed
+                    if ptgen_json is None or ptgen_json.get("error") is not None:
+                        for _retry in range(ptgen_retry):
+                            ptgen_json = await fetch_ptgen(client, url, data)
+                            if ptgen_json is not None and ptgen_json.get("error") is None:
+                                break
+
+                    # Try to extract douban link
+                    try:
+                        if ptgen_json and 'data' in ptgen_json and ptgen_json['data']:
+                            params['url'] = ptgen_json['data'][0]['link']
+                        else:
+                            raise KeyError("No data in response")
+                    except (KeyError, IndexError, TypeError):
+                        console.print("[red]Unable to get data from ptgen using IMDb")
+                        params['url'] = console.input("[red]Please enter [yellow]Douban[/yellow] link: ")
+                else:
+                    console.print("[red]No IMDb id was found.")
+                    params['url'] = console.input("[red]Please enter [yellow]Douban[/yellow] link: ")
+
+                # Fetch with douban URL
+                ptgen_json = await fetch_ptgen(client, url, params)
+                if ptgen_json is None or ptgen_json.get("error") is not None:
+                    for _retry in range(ptgen_retry):
+                        ptgen_json = await fetch_ptgen(client, url, params)
+                        if ptgen_json is not None and ptgen_json.get("error") is None:
+                            break
+
+                if ptgen_json is None:
+                    console.print("[bold red]Failed to get valid ptgen response after retries")
+                    return ""
+
+                meta['ptgen'] = ptgen_json
+                async with aiofiles.open(f"{meta['base_dir']}/tmp/{meta['uuid']}/meta.json", 'w', encoding='utf-8') as f:
+                    await f.write(json.dumps(meta, indent=4))
+
+                ptgen_text = ptgen_json.get('format', '')
+                if "[/img]" in ptgen_text:
+                    ptgen_text = ptgen_text.split("[/img]")[1]
+                ptgen_text = f"[img]{meta.get('imdb_info', {}).get('cover', meta.get('cover', ''))}[/img]{ptgen_text}"
+
         except Exception:
             console.print_exception()
-            console.print(ptgen.text)
-            console.print("[bold red]There was an error getting the ptgen \nUploading without ptgen")
+            console.print("[bold red]There was an error getting the ptgen \\nUploading without ptgen")
             return ""
-        return ptgen
+        return ptgen_text
 
     class MediaInfoParser:
         # Language to ISO country code mapping
@@ -1200,12 +834,12 @@ class COMMON():
             "zulu": ("https://ptpimg.me/7teg09.png", "20")
         }
 
-        def parse_mediainfo(self, mediainfo_text):
+        def parse_mediainfo(self, mediainfo_text: str) -> dict[str, Any]:
             # Patterns for matching sections and fields
             section_pattern = re.compile(r"^(General|Video|Audio|Text|Menu)(?:\s#\d+)?", re.IGNORECASE)
-            parsed_data = {"general": {}, "video": [], "audio": [], "text": []}
-            current_section = None
-            current_track = {}
+            parsed_data: dict[str, Any] = {"general": {}, "video": [], "audio": [], "text": []}
+            current_section: Optional[str] = None
+            current_track: dict[str, str] = {}
 
             # Field lists based on PHP definitions
             general_fields = {'file_name', 'format', 'duration', 'file_size', 'bit_rate'}
@@ -1247,11 +881,7 @@ class COMMON():
                     property_name = property_name.lower().replace(" ", "_")
 
                     # Add property if it's a recognized field for the current section
-                    if current_section == "general" and property_name in general_fields:
-                        current_track[property_name] = property_value
-                    elif current_section == "video" and property_name in video_fields:
-                        current_track[property_name] = property_value
-                    elif current_section == "audio" and property_name in audio_fields:
+                    if current_section == "general" and property_name in general_fields or current_section == "video" and property_name in video_fields or current_section == "audio" and property_name in audio_fields:
                         current_track[property_name] = property_value
                     elif current_section == "text":
                         # Processing specific properties for text
@@ -1300,7 +930,7 @@ class COMMON():
 
             return parsed_data
 
-        def format_bbcode(self, parsed_mediainfo):
+        def format_bbcode(self, parsed_mediainfo: dict[str, Any]) -> str:
             bbcode_output = "\n"
 
             # Format General Section
@@ -1334,11 +964,9 @@ class COMMON():
                         # If language is not found, use a fallback or display the language as plain text
                         parts.append(language.capitalize() if language else "")
 
-                    # Other properties to concatenate
-                    properties = ["language", "codec", "format", "channels", "bit_rate", "format_profile", "stream_size"]
-                    for prop in properties:
-                        if prop in track and track[prop]:  # Only add non-empty properties
-                            parts.append(track[prop])
+                    # Other properties to concatenate (language already handled above)
+                    properties = ["codec", "format", "channels", "bit_rate", "format_profile", "stream_size"]
+                    parts.extend([track[prop] for prop in properties if prop in track and track[prop]])
 
                     # Join parts (starting from index 1, after the track number) with slashes and add to bbcode_output
                     bbcode_output += f"{parts[0]} " + " / ".join(parts[1:]) + "\n"
@@ -1346,7 +974,7 @@ class COMMON():
             # Format Text Section - Centered with flags or text, spaced apart
             if "text" in parsed_mediainfo:
                 bbcode_output += "\n[b]Subtitles[/b]\n"
-                subtitle_entries = []
+                subtitle_entries: list[str] = []
                 for track in parsed_mediainfo["text"]:
                     language_display = track.get("language", "")
                     subtitle_entries.append(language_display)
@@ -1354,3 +982,228 @@ class COMMON():
 
             bbcode_output += "\n"
             return bbcode_output
+
+    async def get_bdmv_mediainfo(self, meta: dict[str, Any], remove: Optional[list[str]] = None, char_limit: int = 0) -> str:
+        """
+        Generate and sanitize MediaInfo for BDMV discs.
+
+        This is required by specific trackers that demand MediaInfo regardless of the media type.
+        Playlists are preferred because raw .m2ts files lack language metadata.
+        However, since playlists can become bloated with hundreds of tracks, the method
+        falls back to the largest .m2ts file if the output exceeds the character limit.
+
+        :param remove: String or list of strings identifying line prefixes to be filtered out.
+                       Useful for avoiding tracker parser errors (e.g., misinterpreting '2 bytes' as '2TB').
+        :param char_limit: Max character length allowed before falling back to the largest M2TS.
+        :return: A string containing the cleaned MediaInfo content.
+        """
+        mediainfo = ''
+        mi_path = f'{meta["base_dir"]}/tmp/{meta["uuid"]}/MEDIAINFO_CLEANPATH.txt'
+
+        if meta.get('is_disc') == 'BDMV':
+            # 1. Generate/Load initial MediaInfo (Playlist) if not exists
+            if not os.path.isfile(mi_path):
+                if meta.get('debug'):
+                    console.print("[blue]Generating MediaInfo for BDMV...[/blue]")
+
+                path = meta['discs'][0]['playlists'][0]['path']
+                await exportInfo(
+                    path,
+                    False,
+                    meta['uuid'],
+                    meta['base_dir'],
+                    is_dvd=False,
+                    debug=meta.get('debug', False)
+                )
+
+            # Helper to read and filter lines from the export file
+            async def read_and_clean() -> str:
+                if not os.path.isfile(mi_path):
+                    return ""
+
+                async with aiofiles.open(mi_path, encoding='utf-8') as f:
+                    lines = await f.readlines()
+
+                if remove:
+                    lines = [
+                        line for line in lines
+                        if not any(line.strip().startswith(prefix) for prefix in remove)
+                    ]
+
+                return ''.join(lines)
+
+            mediainfo = await read_and_clean()
+
+            # 2. Check char_limit and fallback to largest M2TS if necessary
+            if char_limit and len(mediainfo) > char_limit:
+                if meta.get('debug'):
+                    console.print(f"[yellow]MediaInfo length ({len(mediainfo)}) exceeds limit ({char_limit}). Falling back to largest M2TS...[/yellow]")
+
+                items = meta['discs'][0]['playlists'][0].get('items', [])
+
+                if items:
+                    largest_item = max(items, key=lambda x: x.get('size', 0))
+                    largest_m2ts = largest_item.get('file')
+
+                    if largest_m2ts:
+                        if meta.get('debug'):
+                            console.print(f"[blue]Selected largest M2TS from meta: {os.path.basename(largest_m2ts)}[/blue]")
+
+                        await exportInfo(
+                            largest_m2ts,
+                            False,
+                            meta['uuid'],
+                            meta['base_dir'],
+                            is_dvd=False,
+                            debug=meta.get('debug', False)
+                        )
+
+                        mediainfo = await read_and_clean()
+
+        return mediainfo
+
+    async def check_language_requirements(
+        self,
+        meta: dict[str, Any],
+        tracker: str,
+        languages_to_check: list[str],
+        check_audio: bool = False,
+        check_subtitle: bool = False,
+        require_both: bool = False,
+        original_language: bool = False,
+    ) -> bool:
+        """
+        Check if the media metadata meets specific language requirements for audio and/or subtitles.
+
+        The function evaluates whether the provided media contains the required languages.
+        It can also handle logic for original language tracks and cross-reference them
+        with subtitles if the primary audio requirement isn't met.
+
+        :param meta: Dictionary containing media metadata (audio_languages, subtitle_languages, etc.).
+        :type meta: dict[str, Any]
+        :param tracker: Name of the tracker being processed, used for logging/output.
+        :type tracker: str
+        :param languages_to_check: A list of language names or codes to search for.
+        :type languages_to_check: List[str]
+        :param check_audio: If True, validates if required languages are present in audio tracks.
+        :type check_audio: bool
+        :param check_subtitle: If True, validates if required languages are present in subtitle tracks.
+        :type check_subtitle: bool
+        :param require_both: If True, both audio AND subtitle requirements must be satisfied.
+                             If False, satisfying either is enough (OR logic).
+        :type require_both: bool
+        :param original_language: If True, checks if the media's original language matches the audio
+                                  track, allowing a fallback to subtitle-only validation.
+        :type original_language: bool
+        :return: True if language requirements are met, False otherwise.
+        :rtype: bool
+        """
+        try:
+            if not meta.get("language_checked", False):
+                await languages_manager.process_desc_language(meta, tracker=tracker)
+
+            meta_audio_languages: list[str] = meta.get("audio_languages", [])
+            meta_subtitle_languages: list[str] = meta.get("subtitle_languages", [])
+
+            languages_to_check = [lang.lower() for lang in languages_to_check]
+            audio_languages = [lang.lower() for lang in meta_audio_languages]
+            subtitle_languages = [lang.lower() for lang in meta_subtitle_languages]
+            language_display = None
+            original_ok = False
+            if original_language:
+                # Get just the first original language
+                original_language_raw = meta.get("original_language", [])
+                first_lang = ""
+                if original_language_raw:
+                    # Handle both string and list cases
+                    if isinstance(original_language_raw, str):
+                        first_lang = original_language_raw.lower()
+                    elif isinstance(original_language_raw, list) and original_language_raw:
+                        first_lang = original_language_raw[0].lower() if isinstance(original_language_raw[0], str) else ""
+
+                try:
+                    # Clean up the language code - take only the first part before any dash or underscore
+                    clean_lang = first_lang.split('-')[0].split('_')[0].split(',')[0].split(' ')[0].strip().lower()
+                    if clean_lang:
+                        lang = langcodes.Language.get(clean_lang)
+                        language_display = lang.display_name().lower()
+                except (tag_parser.LanguageTagError, LookupError, AttributeError, ValueError) as e:
+                    if meta.get('debug'):
+                        console.print(f"[yellow]Debug: Unable to convert language code '{first_lang}' to full name: {e}[/yellow]")
+
+            if language_display:
+                original_ok = language_display in audio_languages
+
+            audio_ok = (
+                not check_audio
+                or any(lang in audio_languages for lang in languages_to_check)
+            )
+            subtitle_ok = (
+                not check_subtitle
+                or any(lang in subtitle_languages for lang in languages_to_check)
+            )
+
+            if meta.get('debug'):
+                console.print(f"[blue]Debug: Audio Languages Found: {audio_languages}[/blue]")
+                console.print(f"[blue]Debug: Subtitle Languages Found: {subtitle_languages}[/blue]")
+                console.print(f"[blue]Debug: Original Audio Language: {language_display}[/blue]")
+                console.print(f"[blue]Debug: Audio OK: {audio_ok}, Subtitle OK: {subtitle_ok}, Original OK: {original_ok}[/blue]")
+
+            if not audio_ok and original_ok:
+                if subtitle_ok:
+                    return subtitle_ok
+                else:
+                    console.print(
+                        f"[red]Language requirement not met for [bold]{tracker}[/bold].[/red]\n"
+                        f"[yellow]Required subtitles in one of the following with an original audio track:[/yellow] "
+                        f"{', '.join(languages_to_check)}\n"
+                        f"[cyan]Found Audio:[/cyan] {', '.join(audio_languages) or 'None'}\n"
+                        f"[cyan]Found Subtitles:[/cyan] {', '.join(subtitle_languages) or 'None'}\n"
+                        f"[cyan]Original Audio Language:[/cyan] {language_display}"
+                    )
+                    return False
+
+            if require_both:
+                if not (audio_ok and subtitle_ok):
+                    console.print(
+                        f"[red]Language requirement not met for [bold]{tracker}[/bold].[/red]\n"
+                        f"[yellow]Required both audio and subtitles in one of the following:[/yellow] "
+                        f"{', '.join(languages_to_check)}\n"
+                        f"[cyan]Found Audio:[/cyan] {', '.join(audio_languages) or 'None'}\n"
+                        f"[cyan]Found Subtitles:[/cyan] {', '.join(subtitle_languages) or 'None'}"
+                    )
+            else:
+                if not (audio_ok or subtitle_ok):
+                    console.print(
+                        f"[red]Language requirement not met for [bold]{tracker}[/bold].[/red]\n"
+                        f"[yellow]Required at least one of the following:[/yellow] "
+                        f"{', '.join(languages_to_check)}\n"
+                        f"[cyan]Found Audio:[/cyan] {', '.join(audio_languages) or 'None'}\n"
+                        f"[cyan]Found Subtitles:[/cyan] {', '.join(subtitle_languages) or 'None'}"
+                    )
+
+            if require_both:
+                return audio_ok and subtitle_ok
+            else:
+                return audio_ok or subtitle_ok
+
+        except Exception as e:
+            console.print_exception()
+            console.print(f"[red]Error checking language requirements: {e}[/red]")
+            return False
+
+    async def save_html_file(self, meta: dict[str, Any], tracker: str, text: str = "", file_name: str = "") -> str:
+        """
+        Save provided text as an HTML file.
+
+        :param tracker: Name of the tracker for naming the file.
+        :param text: The HTML content to save.
+        :param file_name: Optional custom file name (without extension).
+        :return: Path to the saved HTML file.
+        :rtype: str
+        """
+        html_path = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}]{file_name}.html"
+        os.makedirs(os.path.dirname(html_path), exist_ok=True)
+        async with aiofiles.open(html_path, "w", encoding="utf-8") as f:
+            await f.write(text)
+        return html_path

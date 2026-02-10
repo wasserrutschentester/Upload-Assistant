@@ -1,0 +1,31 @@
+services:
+  upload-assistant-cli:
+    image: ghcr.io/audionut/upload-assistant:latest
+    container_name: UA
+    restart: unless-stopped
+    networks:
+      - yournetwork #change to the network with ur torrent instance
+    ports: 
+      # Change left side to your specific port. Use 0.0.0.0:5000:5000 to expose to ANY device.
+      # 127.0.0.1 means only accessible from the host machine. If you change to 0.0.0.0:5000:5000 it will be accessible from any device on the network
+      # including devices outside your network if your router/reverse proxy allows it.
+      - "127.0.0.1:5000:5000"
+    environment:
+      # Required if not using paths from terminal: allowlisted roots the Web UI is allowed to browse/execute within
+      - UA_BROWSE_ROOTS=/data/torrents,/Upload-Assistant/tmp
+      # Optional: set secret key as key, or use file variant to read from a file. (minimum 32 bytes) permissions handling will apply.
+      # - ENV_SESSION_SECRET="SESSION_SECRET"
+      # - ENV_SESSION_SECRET_FILE="SESSION_SECRET_FILE"
+      # Optional: only needed if you serve the UI from a different origin/domain.
+      # - UA_WEBUI_CORS_ORIGINS=https://your-ui-host
+    entrypoint: /bin/bash
+    command: -c "source /venv/bin/activate && exec python /Upload-Assistant/upload.py --webui 0.0.0.0:5000"
+    volumes:
+      - /path/to/torrents/:/data/torrents/:rw #map this to qbit download location, map exactly as qbittorent template on both sides.
+      - /mnt/user/appdata/Upload-Assistant/data/config.py:/Upload-Assistant/data/config.py:rw # Optional: will be created automatically if missing
+      - /mnt/user/appdata/qBittorrent/data/BT_backup/:/torrent_storage_dir:rw #map this to your qbittorrent bt_backup
+      - /mnt/user/appdata/Upload-Assistant/tmp/:/Upload-Assistant/tmp:rw #map this to your /tmp folder.
+      - /mnt/user/appdata/Upload-Assistant/webui-auth:/root/.config/upload-assistant:rw # persist web UI session auth config
+networks:
+  "yournetwork": #change this to your network 
+    external: true

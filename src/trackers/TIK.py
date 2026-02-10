@@ -1,212 +1,113 @@
-# -*- coding: utf-8 -*-
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
 # import discord
-import asyncio
-import requests
 import os
 import re
-import platform
-import sys
-import cli_ui
 import urllib.request
+from typing import Any, Optional, cast
+from urllib.parse import urlparse
+
+import aiofiles
+import cli_ui
 import click
-import httpx
-from src.trackers.COMMON import COMMON
+
 from src.console import console
-from src.uploadscreens import upload_screens
+from src.get_desc import DescriptionBuilder
+from src.trackers.UNIT3D import UNIT3D
+from src.uploadscreens import UploadScreensManager
+
+Meta = dict[str, Any]
+Config = dict[str, Any]
 
 
-class TIK():
-    """
-    Edit for Tracker:
-        Edit BASE.torrent with announce and source
-        Check for duplicates
-        Set type/category IDs
-        Upload
-    """
-
-    def __init__(self, config):
-        self.config = config
+class TIK(UNIT3D):
+    def __init__(self, config: Config) -> None:
+        super().__init__(config, tracker_name='TIK')
+        self.config: Config = config
+        self.uploadscreens_manager = UploadScreensManager(config)
         self.tracker = 'TIK'
-        self.source_flag = 'TIK'
-        self.search_url = 'https://cinematik.net/api/torrents/filter'
-        self.upload_url = 'https://cinematik.net/api/torrents/upload'
-        self.torrent_url = 'https://cinematik.net/torrents/'
-        self.signature = "\n[center][url=https://github.com/Audionut/Upload-Assistant]Created by Audionut's Upload Assistant[/url][/center]"
-        self.banned_groups = [""]
+        self.base_url = 'https://cinematik.net'
+        self.id_url = f'{self.base_url}/api/torrents/'
+        self.upload_url = f'{self.base_url}/api/torrents/upload'
+        self.search_url = f'{self.base_url}/api/torrents/filter'
+        self.torrent_url = f'{self.base_url}/torrents/'
+        self.banned_groups = []
         pass
 
-    async def upload(self, meta, disctype):
-        common = COMMON(config=self.config)
-        await common.edit_torrent(meta, self.tracker, self.source_flag)
-        await common.unit3d_edit_desc(meta, self.tracker, self.signature, comparison=True)
-        cat_id = await self.get_cat_id(meta['category'], meta.get('foreign'), meta.get('opera'), meta.get('asian'))
-        type_id = await self.get_type_id(disctype)
-        resolution_id = await self.get_res_id(meta['resolution'])
-        modq = await self.get_flag(meta, 'modq')
-        region_id = await common.unit3d_region_ids(meta.get('region'))
-        distributor_id = await common.unit3d_distributor_ids(meta.get('distributor'))
-        if meta['anon'] == 0 and not self.config['TRACKERS'][self.tracker].get('anon', False):
-            anon = 0
-        else:
-            anon = 1
+    async def get_additional_checks(self, meta: Meta) -> bool:
+        should_continue = True
 
-        if not meta['is_disc']:
+        if not meta.get('is_disc'):
             console.print("[red]Only disc-based content allowed at TIK")
-            return
-        elif meta['bdinfo'] is not None:
-            mi_dump = None
-            with open(f"{meta['base_dir']}/tmp/{meta['uuid']}/BD_SUMMARY_00.txt", 'r', encoding='utf-8') as bd_file:
-                bd_dump = bd_file.read()
-        else:
-            with open(f"{meta['base_dir']}/tmp/{meta['uuid']}/MEDIAINFO.txt", 'r', encoding='utf-8') as mi_file:
-                mi_dump = mi_file.read()
-            bd_dump = None
+            return False
 
-        if meta.get('desclink'):
-            desc = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}]DESCRIPTION.txt", "r", encoding='utf-8').read()
-            print(f"Custom Description Link: {desc}")
+        return should_continue
 
-        elif meta.get('descfile'):
-            desc = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}]DESCRIPTION.txt", "r", encoding='utf-8').read()
-            print(f"Custom Description File Path: {desc}")
-
-        else:
-            await self.edit_desc(meta)
-            desc = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}]DESCRIPTION.txt", "r", encoding='utf-8').read()
-
-        open_torrent = open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}].torrent", 'rb')
-        files = {'torrent': open_torrent}
-        data = {
-            'name': await self.get_name(meta, disctype),
-            'description': desc,
-            'mediainfo': mi_dump,
-            'bdinfo': bd_dump,
-            'category_id': cat_id,
-            'type_id': type_id,
-            'resolution_id': resolution_id,
-            'tmdb': meta['tmdb'],
-            'imdb': meta['imdb'].replace('tt', ''),
-            'tvdb': meta['tvdb_id'],
-            'mal': meta['mal_id'],
-            'igdb': 0,
-            'anonymous': anon,
-            'stream': meta['stream'],
-            'sd': meta['sd'],
-            'keywords': meta['keywords'],
-            'personal_release': 0,
-            'internal': 0,
-            'featured': 0,
-            'free': 0,
-            'doubleup': 0,
-            'sticky': 0,
-            'mod_queue_opt_in': modq,
-        }
-        # Internal
-        if self.config['TRACKERS'][self.tracker].get('internal', False) is True:
-            if meta['tag'] != "" and (meta['tag'][1:] in self.config['TRACKERS'][self.tracker].get('internal_groups', [])):
-                data['internal'] = 1
-        if self.config['TRACKERS'][self.tracker].get('personal', False) is True:
-            if meta['tag'] != "" and (meta['tag'][1:] in self.config['TRACKERS'][self.tracker].get('personal_group', [])):
-                data['personal_release'] = 1
-
-        if region_id != 0:
-            data['region_id'] = region_id
-        if distributor_id != 0:
-            data['distributor_id'] = distributor_id
-        if meta.get('category') == "TV":
-            data['season_number'] = meta.get('season_int', '0')
-            data['episode_number'] = meta.get('episode_int', '0')
-        headers = {
-            'User-Agent': f'Upload Assistant/2.2 ({platform.system()} {platform.release()})'
-        }
-        params = {
-            'api_token': self.config['TRACKERS'][self.tracker]['api_key'].strip()
+    async def get_additional_data(self, meta: Meta) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            'modq': await self.get_flag(meta, 'modq'),
         }
 
-        if meta['debug'] is False:
-            response = requests.post(url=self.upload_url, files=files, data=data, headers=headers, params=params)
-            try:
-                meta['tracker_status'][self.tracker]['status_message'] = response.json()
-                # adding torrent link to comment of torrent file
-                t_id = response.json()['data'].split(".")[1].split("/")[3]
-                meta['tracker_status'][self.tracker]['torrent_id'] = t_id
-                await common.add_tracker_torrent(meta, self.tracker, self.source_flag, self.config['TRACKERS'][self.tracker].get('announce_url'), "https://cinematik.net/torrents/" + t_id)
-            except Exception:
-                console.print("It may have uploaded, go check")
-                return
-        else:
-            console.print("[cyan]Request Data:")
-            console.print(data)
-            meta['tracker_status'][self.tracker]['status_message'] = "Debug mode enabled, not uploading."
-        open_torrent.close()
+        return data
 
-    def get_basename(self, meta):
-        path = next(iter(meta['filelist']), meta['path'])
-        return os.path.basename(path)
-
-    async def get_name(self, meta, disctype):
+    async def get_name(self, meta: Meta) -> dict[str, str]:
         disctype = meta.get('disctype', None)
-        basename = self.get_basename(meta)
-        type = meta.get('type', "")
-        title = meta.get('title', "").replace('AKA', '/').strip()
-        alt_title = meta.get('aka', "").replace('AKA', '/').strip()
-        year = meta.get('year', "")
-        resolution = meta.get('resolution', "")
-        season = meta.get('season', "")
-        repack = meta.get('repack', "")
+        filelist = cast(list[Any], meta.get('filelist', []))
+        basename = os.path.basename(next(iter(filelist), str(meta.get('path', ''))))
+        type_value = str(meta.get('type', ""))
+        title = str(meta.get('title', "")).replace('AKA', '/').strip()
+        alt_title = str(meta.get('aka', "")).replace('AKA', '/').strip()
+        year = str(meta.get('year', ""))
+        resolution = str(meta.get('resolution', ""))
+        season = str(meta.get('season', ""))
+        repack = str(meta.get('repack', ""))
         if repack.strip():
             repack = f"[{repack}]"
-        three_d = meta.get('3D', "")
+        three_d = str(meta.get('3D', ""))
         three_d_tag = f"[{three_d}]" if three_d else ""
-        tag = meta.get('tag', "").replace("-", "- ")
+        tag = str(meta.get('tag', "")).replace("-", "- ")
         if tag == "":
             tag = "- NOGRP"
-        source = meta.get('source', "")
-        uhd = meta.get('uhd', "")  # noqa #841
-        hdr = meta.get('hdr', "")
+        source = str(meta.get('source', ""))
+        hdr = str(meta.get('hdr', ""))
         if not hdr.strip():
             hdr = "SDR"
-        distributor = meta.get('distributor', "")  # noqa F841
-        video_codec = meta.get('video_codec', "")
-        video_encode = meta.get('video_encode', "").replace(".", "")
+        video_codec = str(meta.get('video_codec', ""))
+        video_encode = str(meta.get('video_encode', "")).replace(".", "")
         if 'x265' in basename:
             video_encode = video_encode.replace('H', 'x')
-        dvd_size = meta.get('dvd_size', "")
-        search_year = meta.get('search_year', "")
+        dvd_size = str(meta.get('dvd_size', ""))
+        search_year = str(meta.get('search_year', ""))
         if not str(search_year).strip():
             search_year = year
-
-        category_name = meta.get('category', "")
-        foreign = meta.get('foreign')
-        opera = meta.get('opera')
-        asian = meta.get('asian')
-        meta['category_id'] = await self.get_cat_id(category_name, foreign, opera, asian)
+        meta['category_id'] = (await self.get_category_id(meta))['category_id']
 
         name = ""
         alt_title_part = f" {alt_title}" if alt_title else ""
         if meta['category_id'] in ("1", "3", "5", "6"):
-            if meta['is_disc'] == 'BDMV':
+            if meta.get('is_disc') == 'BDMV':
                 name = f"{title}{alt_title_part} ({year}) {disctype} {resolution} {video_codec} {three_d_tag}"
-            elif meta['is_disc'] == 'DVD':
+            elif meta.get('is_disc') == 'DVD':
                 name = f"{title}{alt_title_part} ({year}) {source} {dvd_size}"
-        elif meta['category'] == "TV":  # TV SPECIFIC
-            if type == "DISC":  # Disk
-                if meta['is_disc'] == 'BDMV':
-                    name = f"{title}{alt_title_part} ({search_year}) {season} {disctype} {resolution} {video_codec}"
-                if meta['is_disc'] == 'DVD':
-                    name = f"{title}{alt_title_part} ({search_year}) {season} {source} {dvd_size}"
+        elif meta.get('category') == "TV" and type_value == "DISC":  # TV SPECIFIC - Disk
+            if meta.get('is_disc') == 'BDMV':
+                name = f"{title}{alt_title_part} ({search_year}) {season} {disctype} {resolution} {video_codec}"
+            if meta.get('is_disc') == 'DVD':
+                name = f"{title}{alt_title_part} ({search_year}) {season} {source} {dvd_size}"
 
-        # User confirmation
-        console.print(f"[yellow]Final generated name: [greee]{name}")
-        confirmation = cli_ui.ask_yes_no("Do you want to use this name?", default=False)  # Default is 'No'
+        return {'name': name}
 
-        if confirmation:
-            return name
-        else:
-            console.print("[red]Sorry, this seems to be an edge case, please report at (insert_link)")
-            sys.exit(1)
-
-    async def get_cat_id(self, category_name, foreign, opera, asian):
+    async def get_category_id(
+        self,
+        meta: Meta,
+        category: Optional[str] = None,
+        reverse: bool = False,
+        mapping_only: bool = False
+    ) -> dict[str, str]:
+        _ = (category, reverse, mapping_only)
+        category_name = str(meta.get('category', ''))
+        foreign = bool(meta.get('foreign', False))
+        opera = bool(meta.get('opera', False))
+        asian = bool(meta.get('asian', False))
         category_id = {
             'FILM': '1',
             'TV': '2',
@@ -233,9 +134,17 @@ class TIK():
             else:
                 category_id = '2'
 
-        return category_id
+        return {'category_id': category_id}
 
-    async def get_type_id(self, disctype):
+    async def get_type_id(
+        self,
+        meta: Meta,
+        type: Optional[str] = None,
+        reverse: bool = False,
+        mapping_only: bool = False
+    ) -> dict[str, str]:
+        _ = (type, reverse, mapping_only)
+        disctype = meta.get('disctype', None)
         type_id_map = {
             'Custom': '1',
             'BD100': '3',
@@ -251,14 +160,26 @@ class TIK():
 
         if not disctype:
             console.print("[red]You must specify a --disctype")
-            return None
+            # Raise an exception since we can't proceed without disctype
+            raise ValueError("disctype is required for TIK tracker but was not provided")
 
-        disctype_value = disctype[0] if isinstance(disctype, list) else disctype
+        disctype_value = (
+            str(cast(Any, disctype[0]))
+            if isinstance(disctype, list) and disctype
+            else str(cast(Any, disctype))
+        )
         type_id = type_id_map.get(disctype_value, '1')  # '1' is the default fallback
 
-        return type_id
+        return {'type_id': type_id}
 
-    async def get_res_id(self, resolution):
+    async def get_resolution_id(
+        self,
+        meta: Meta,
+        resolution: Optional[str] = None,
+        reverse: bool = False,
+        mapping_only: bool = False
+    ) -> dict[str, str]:
+        _ = (resolution, reverse, mapping_only)
         resolution_id = {
             'Other': '10',
             '4320p': '1',
@@ -271,33 +192,27 @@ class TIK():
             '576i': '7',
             '480p': '8',
             '480i': '9'
-        }.get(resolution, '10')
-        return resolution_id
+        }.get(str(meta.get('resolution', '')), '10')
+        return {'resolution_id': resolution_id}
 
-    async def get_flag(self, meta, flag_name):
-        config_flag = self.config['TRACKERS'][self.tracker].get(flag_name)
-        if config_flag is not None:
-            return 1 if config_flag else 0
+    async def get_description(self, meta: Meta) -> dict[str, str]:
+        if meta.get('description_link') or meta.get('description_file'):
+            desc = await DescriptionBuilder(self.tracker, self.config).unit3d_edit_desc(meta, comparison=True)
 
-        return 1 if meta.get(flag_name, False) else 0
+            console.print(f'Custom Description Link/File Path: {desc}', markup=False)
+            return {'description': desc}
 
-    async def edit_desc(self, meta):
-        if len(meta.get('discs', [])) > 0:
-            summary = meta['discs'][0].get('summary', '')
-        else:
-            summary = None
+        discs = cast(list[dict[str, Any]], meta.get('discs', []))
+        summary = discs[0].get('summary', '') if len(discs) > 0 else None
 
         # Proceed with matching Total Bitrate if the summary exists
         if summary:
             match = re.search(r"Total Bitrate: ([\d.]+ Mbps)", summary)
-            if match:
-                total_bitrate = match.group(1)
-            else:
-                total_bitrate = "Unknown"
+            total_bitrate = match.group(1) if match else "Unknown"
         else:
             total_bitrate = "Unknown"
 
-        country_name = self.country_code_to_name(meta.get('region'))
+        country_name = self.country_code_to_name(str(meta.get('region', '')))
 
         # Rehost poster if tmdb_poster is available
         poster_url = f"https://image.tmdb.org/t/p/original{meta.get('tmdb_poster', '')}"
@@ -317,7 +232,10 @@ class TIK():
             # No poster file exists, download the poster image
             poster_path = poster_jpg_path  # Default to saving as poster.jpg
             try:
-                urllib.request.urlretrieve(poster_url, poster_path)
+                parsed_url = urlparse(poster_url)
+                if parsed_url.scheme not in ('http', 'https'):
+                    raise ValueError(f"Invalid URL scheme: {parsed_url.scheme}")
+                urllib.request.urlretrieve(poster_url, poster_path)  # nosec B310
                 console.print(f"[green]Poster downloaded to {poster_path}[/green]")
             except Exception as e:
                 console.print(f"[red]Error downloading poster: {e}[/red]")
@@ -326,23 +244,23 @@ class TIK():
         if os.path.exists(poster_path):
             try:
                 console.print("Uploading standard poster to image host....")
-                new_poster_url, _ = upload_screens(meta, 1, 1, 0, 1, [poster_path], {})
+                new_poster_url, _ = await self.uploadscreens_manager.upload_screens(meta, 1, 1, 0, 1, [poster_path], {})
 
                 # Ensure that the new poster URL is assigned only once
-                if len(new_poster_url) > 0:
-                    poster_url = new_poster_url[0]['raw_url']
+                poster_urls = new_poster_url
+                if len(poster_urls) > 0:
+                    poster_url = str(poster_urls[0].get('raw_url', poster_url))
             except Exception as e:
                 console.print(f"[red]Error uploading poster: {e}[/red]")
         else:
             console.print("[red]Poster file not found, cannot upload.[/red]")
 
         # Generate the description text
-        desc_text = []
+        desc_text: list[str] = []
 
-        images = meta['image_list']
-        discs = meta.get('discs', [])  # noqa #F841
+        images = cast(list[dict[str, Any]], meta.get('image_list', []))
 
-        if len(images) >= 4:
+        if len(images) >= 6:
             image_link_1 = images[0]['raw_url']
             image_link_2 = images[1]['raw_url']
             image_link_3 = images[2]['raw_url']
@@ -379,27 +297,36 @@ class TIK():
         # Write technical info section
         desc_text.append("[h3]Technical Info[/h3]\n")
         desc_text.append("[code]\n")
-        if meta['is_disc'] == 'BDMV':
-            desc_text.append(f"  Disc Label.........:{meta.get('bdinfo', {}).get('label', '')}\n")
-        desc_text.append(f"  IMDb...............: [url]https://www.imdb.com/title/tt{meta.get('imdb_id')}{meta.get('imdb_rating', '')}[/url]\n")
+        bdinfo = cast(dict[str, Any], meta.get('bdinfo', {}))
+        if meta.get('is_disc') == 'BDMV':
+            desc_text.append(f"  Disc Label.........:{bdinfo.get('label', '')}\n")
+        imdb_info = cast(dict[str, Any], meta.get('imdb_info', {}))
+        desc_text.append(f"  IMDb...............: [url]{str(imdb_info.get('imdb_url', ''))}{str(meta.get('imdb_rating', ''))}[/url]\n")
         desc_text.append(f"  Year...............: {meta.get('year', '')}\n")
         desc_text.append(f"  Country............: {country_name}\n")
-        if meta['is_disc'] == 'BDMV':
-            desc_text.append(f"  Runtime............: {meta.get('bdinfo', {}).get('length', '')} hrs [color=red](double check this is actual runtime)[/color]\n")
+        if meta.get('is_disc') == 'BDMV':
+            desc_text.append(f"  Runtime............: {bdinfo.get('length', '')} hrs [color=red](double check this is actual runtime)[/color]\n")
         else:
             desc_text.append("  Runtime............:  [color=red]Insert the actual runtime[/color]\n")
 
-        if meta['is_disc'] == 'BDMV':
-            audio_languages = ', '.join([f"{track.get('language', 'Unknown')} {track.get('codec', 'Unknown')} {track.get('channels', 'Unknown')}" for track in meta.get('bdinfo', {}).get('audio', [])])
+        if meta.get('is_disc') == 'BDMV':
+            audio_tracks = cast(list[dict[str, Any]], bdinfo.get('audio', []))
+            audio_languages = ', '.join(
+                [
+                    f"{track.get('language', 'Unknown')} {track.get('codec', 'Unknown')} {track.get('channels', 'Unknown')}"
+                    for track in audio_tracks
+                ]
+            )
             desc_text.append(f"  Audio..............: {audio_languages}\n")
-            desc_text.append(f"  Subtitles..........: {', '.join(meta.get('bdinfo', {}).get('subtitles', []))}\n")
+            subtitles = cast(list[Any], bdinfo.get('subtitles', []))
+            desc_text.append(f"  Subtitles..........: {', '.join([str(sub) for sub in subtitles])}\n")
         else:
             # Process each disc's `vob_mi` or `ifo_mi` to extract audio and subtitles separately
-            for disc in meta.get('discs', []):
-                vob_mi = disc.get('vob_mi', '')
-                ifo_mi = disc.get('ifo_mi', '')
+            for disc in discs:
+                vob_mi = str(disc.get('vob_mi', ''))
+                ifo_mi = str(disc.get('ifo_mi', ''))
 
-                unique_audio = set()  # Store unique audio strings
+                unique_audio: set[str] = set()  # Store unique audio strings
 
                 audio_section = vob_mi.split('\n\nAudio\n')[1].split('\n\n')[0] if 'Audio\n' in vob_mi else None
                 if audio_section:
@@ -419,7 +346,8 @@ class TIK():
                     channels = audio_section.split("Channel(s)")[1].split(":")[1].strip().split(" ")[0] if "Channel(s)" in audio_section else "Unknown"
                     # Convert 6 channels to 5.1, otherwise leave as is
                     channels = "5.1" if channels == "6" else channels
-                    language = disc.get('ifo_mi_full', '').split('Language')[1].split(":")[1].strip().split('\n')[0] if "Language" in disc.get('ifo_mi_full', '') else "Unknown"
+                    ifo_full = str(disc.get('ifo_mi_full', ''))
+                    language = ifo_full.split('Language')[1].split(":")[1].strip().split('\n')[0] if "Language" in ifo_full else "Unknown"
                     audio_info = f"{language} {codec} {channels}"
                     unique_audio.add(audio_info)
 
@@ -434,19 +362,20 @@ class TIK():
                 if unique_subtitles:
                     desc_text.append(f"  Subtitles..........: {', '.join(sorted(unique_subtitles))}\n")
 
-        if meta['is_disc'] == 'BDMV':
-            video_info = meta.get('bdinfo', {}).get('video', [])
-            video_codec = video_info[0].get('codec', 'Unknown')
-            video_bitrate = video_info[0].get('bitrate', 'Unknown')
-            desc_text.append(f"  Video Format.......: {video_codec} / {video_bitrate}\n")
+        if meta.get('is_disc') == 'BDMV':
+            video_info = cast(list[dict[str, Any]], bdinfo.get('video', []))
+            video_resolution = video_info[0].get('resolution', 'Unknown') if video_info else 'Unknown'
+            desc_text.append(f"  Video Format.......: {video_resolution}\n")
         else:
             desc_text.append(f"  DVD Format.........: {meta.get('source', 'Unknown')}\n")
         desc_text.append("  Film Aspect Ratio..: [color=red]The actual aspect ratio of the content, not including the black bars[/color]\n")
-        if meta['is_disc'] == 'BDMV':
+        if meta.get('is_disc') == 'BDMV':
             desc_text.append(f"  Source.............: {meta.get('disctype', 'Unknown')}\n")
         else:
             desc_text.append(f"  Source.............: {meta.get('dvd_size', 'Unknown')}\n")
-        desc_text.append(f"  Film Distributor...: [url={meta.get('distributor_link', '')}]{meta.get('distributor', 'Unknown')}[/url] [color=red]Don't forget the actual distributor link\n")
+        desc_text.append(
+            f"  Film Distributor...: [url={meta.get('distributor_link', '')}]{meta.get('distributor', 'Unknown')}[/url] [color=red]Don't forget the actual distributor link\n"
+        )
         desc_text.append(f"  Average Bitrate....: {total_bitrate}\n")
         desc_text.append("  Ripping Program....:  [color=red]Specify - if it's your rip or custom version, otherwise 'Not my rip'[/color]\n")
         desc_text.append("\n")
@@ -485,9 +414,9 @@ class TIK():
         # Ask user if they want to edit or keep the description
         console.print(f"Current description: {description}", markup=False)
         console.print("[cyan]Do you want to edit or keep the description?[/cyan]")
-        edit_choice = input("Enter 'e' to edit, or press Enter to keep it as is: ")
+        edit_choice = cli_ui.ask_string("Enter 'e' to edit, or press Enter to keep it as is: ")
 
-        if edit_choice.lower() == 'e':
+        if (edit_choice or "").lower() == 'e':
             edited_description = click.edit(description)
             if edited_description:
                 description = edited_description.strip()
@@ -496,11 +425,17 @@ class TIK():
             console.print("[green]Keeping the original description.[/green]")
 
         # Write the final description to the file
-        with open(f"{meta['base_dir']}/tmp/{meta['uuid']}/[{self.tracker}]DESCRIPTION.txt", 'w', encoding="utf-8") as desc_file:
-            desc_file.write(description)
+        async with aiofiles.open(
+            f'{meta["base_dir"]}/tmp/{meta["uuid"]}/[{self.tracker}]DESCRIPTION.txt',
+            'w',
+            encoding='utf-8'
+        ) as desc_file:
+            await desc_file.write(description)
 
-    def parse_subtitles(self, disc_mi):
-        unique_subtitles = set()  # Store unique subtitle strings
+        return {'description': description}
+
+    def parse_subtitles(self, disc_mi: str) -> set[str]:
+        unique_subtitles: set[str] = set()  # Store unique subtitle strings
         lines = disc_mi.splitlines()  # Split the multiline text into individual lines
         current_block = None
 
@@ -517,7 +452,7 @@ class TIK():
 
         return unique_subtitles
 
-    def country_code_to_name(self, code):
+    def country_code_to_name(self, code: str) -> str:
         country_mapping = {
             'AFG': 'Afghanistan', 'ALB': 'Albania', 'DZA': 'Algeria', 'AND': 'Andorra', 'AGO': 'Angola',
             'ARG': 'Argentina', 'ARM': 'Armenia', 'AUS': 'Australia', 'AUT': 'Austria', 'AZE': 'Azerbaijan',
@@ -560,36 +495,3 @@ class TIK():
             'YEM': 'Yemen', 'ZMB': 'Zambia', 'ZWE': 'Zimbabwe'
         }
         return country_mapping.get(code.upper(), 'Unknown Country')
-
-    async def search_existing(self, meta, disctype):
-        dupes = []
-        disctype = meta.get('disctype', None)
-        params = {
-            'api_token': self.config['TRACKERS'][self.tracker]['api_key'].strip(),
-            'tmdbId': meta['tmdb'],
-            'categories[]': await self.get_cat_id(meta['category'], meta.get('foreign'), meta.get('opera'), meta.get('asian')),
-            'types[]': await self.get_type_id(disctype),
-            'resolutions[]': await self.get_res_id(meta['resolution']),
-            'name': ""
-        }
-        if meta.get('edition', "") != "":
-            params['name'] = params['name'] + f" {meta['edition']}"
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(url=self.search_url, params=params)
-                if response.status_code == 200:
-                    data = response.json()
-                    for each in data['data']:
-                        result = [each][0]['attributes']['name']
-                        dupes.append(result)
-                else:
-                    console.print(f"[bold red]Failed to search torrents. HTTP Status: {response.status_code}")
-        except httpx.TimeoutException:
-            console.print("[bold red]Request timed out after 5 seconds")
-        except httpx.RequestError as e:
-            console.print(f"[bold red]Unable to search for existing torrents: {e}")
-        except Exception as e:
-            console.print(f"[bold red]Unexpected error: {e}")
-            await asyncio.sleep(5)
-
-        return dupes

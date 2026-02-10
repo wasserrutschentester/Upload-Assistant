@@ -1,33 +1,103 @@
-# -*- coding: utf-8 -*-
-from torf import Torrent
-import xmlrpc.client
-import bencode
-import os
-import qbittorrentapi
-from deluge_client import DelugeRPCClient
-import transmission_rpc
-import base64
-import errno
+# Upload Assistant © 2025 Audionut & wastaken7 — Licensed under UAPL v1.0
 import asyncio
-import ssl
-import shutil
-import time
-from src.console import console
+import os
 import re
-import platform
-from cogs.redaction import redact_private_info
+import shutil
+import urllib.parse
+from pathlib import Path
+from typing import Any, Optional, Union, cast
+
+import aiohttp
+import defusedxml.xmlrpc
+import qbittorrentapi
+from torf import Torrent
+
+from src.console import console
+from src.torrent_clients import DelugeClientMixin, QbittorrentClientMixin, RtorrentClientMixin, TransmissionClientMixin
+
+# Secure XML-RPC client using defusedxml to prevent XML attacks
+defusedxml.xmlrpc.monkey_patch()
 
 
-class Clients():
-    """
-    Add to torrent client
-    """
-    def __init__(self, config):
+class Clients(QbittorrentClientMixin, RtorrentClientMixin, DelugeClientMixin, TransmissionClientMixin):
+    def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
-        pass
 
-    async def add_to_client(self, meta, tracker):
-        torrent_path = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}].torrent"
+    @staticmethod
+    def _extract_tracker_ids_from_comment(comment: str) -> dict[str, str]:
+        if not comment:
+            return {}
+
+        def _is_host(host: str, domain: str) -> bool:
+            host = host.lower()
+            domain = domain.lower()
+            return host == domain or host.endswith(f".{domain}")
+
+        def _last_path_id(path: str) -> Optional[str]:
+            match = re.search(r"/(\d+)$", path)
+            return match.group(1) if match else None
+
+        def _query_id(query: str, key: str) -> Optional[str]:
+            values = urllib.parse.parse_qs(query).get(key)
+            return values[0] if values else None
+
+        tracker_ids: dict[str, str] = {}
+        urls: list[str] = re.findall(r"https?://[^\s\"'<>]+", comment)
+        for url in urls:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.hostname or "").lower()
+            path = parsed.path
+
+            if _is_host(host, "passthepopcorn.me"):
+                ptp_id = _query_id(parsed.query, "torrentid")
+                if ptp_id:
+                    tracker_ids["ptp"] = ptp_id
+            elif _is_host(host, "aither.cc"):
+                tracker_id = _last_path_id(path)
+                if tracker_id:
+                    tracker_ids["aither"] = tracker_id
+            elif _is_host(host, "lst.gg"):
+                tracker_id = _last_path_id(path)
+                if tracker_id:
+                    tracker_ids["lst"] = tracker_id
+            elif _is_host(host, "onlyencodes.cc"):
+                tracker_id = _last_path_id(path)
+                if tracker_id:
+                    tracker_ids["oe"] = tracker_id
+            elif _is_host(host, "blutopia.cc"):
+                tracker_id = _last_path_id(path)
+                if tracker_id:
+                    tracker_ids["blu"] = tracker_id
+            elif _is_host(host, "upload.cx"):
+                tracker_id = _last_path_id(path)
+                if tracker_id:
+                    tracker_ids["ulcx"] = tracker_id
+            elif _is_host(host, "hdbits.org"):
+                hdb_id = _query_id(parsed.query, "id")
+                if hdb_id:
+                    tracker_ids["hdb"] = hdb_id
+            elif _is_host(host, "broadcasthe.net"):
+                btn_id = _query_id(parsed.query, "id")
+                if btn_id:
+                    tracker_ids["btn"] = btn_id
+            elif _is_host(host, "beyond-hd.me"):
+                match = re.search(r"/details/(\d+)", path)
+                if match:
+                    tracker_ids["bhd"] = match.group(1)
+            elif _is_host(host, "hawke.uno"):
+                tracker_id = _last_path_id(path)
+                if tracker_id:
+                    tracker_ids["huno"] = tracker_id
+
+        return tracker_ids
+
+    async def add_to_client(self, meta: dict[str, Any], tracker: str, cross: bool = False) -> None:
+        if cross:
+            torrent_path = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}_cross].torrent"
+        elif meta['debug']:
+            torrent_path = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}_DEBUG].torrent"
+        else:
+            torrent_path = f"{meta['base_dir']}/tmp/{meta['uuid']}/[{tracker}].torrent"
         if meta.get('no_seed', False) is True:
             console.print("[bold red]--no-seed was passed, so the torrent will not be added to the client")
             console.print("[bold yellow]Add torrent manually to the client")
@@ -35,120 +105,396 @@ class Clients():
         if os.path.exists(torrent_path):
             torrent = Torrent.read(torrent_path)
         else:
+            console.print(f"[bold red]Torrent file {torrent_path} does not exist, cannot add to client")
             return
-        if meta.get('client', None) is None:
-            default_torrent_client = self.config['DEFAULT']['default_torrent_client']
-        else:
-            default_torrent_client = meta['client']
-        if meta.get('client', None) == 'none':
-            return
-        if default_torrent_client == "none":
-            return
-        client = self.config['TORRENT_CLIENTS'][default_torrent_client]
-        torrent_client = client['torrent_client']
 
-        local_path, remote_path = await self.remote_path_map(meta)
+        inject_clients: list[str] = []
+        client_value = meta.get('client')
+        if isinstance(client_value, str) and client_value != 'none':
+            inject_clients = [client_value]
+            if meta['debug']:
+                console.print(f"[cyan]DEBUG: Using client from meta: {inject_clients}[/cyan]")
+        elif client_value == 'none':
+            if meta['debug']:
+                console.print("[cyan]DEBUG: meta client is 'none', skipping adding to client[/cyan]")
+            return
+        else:
+            try:
+                inject_clients_config = self.config['DEFAULT'].get('injecting_client_list')
+                if isinstance(inject_clients_config, str) and inject_clients_config.strip():
+                    inject_clients = [inject_clients_config]
+                    if meta['debug']:
+                        console.print(f"[cyan]DEBUG: Converted injecting_client_list string to list: {inject_clients}[/cyan]")
+                elif isinstance(inject_clients_config, list):
+                    # Filter out empty strings and whitespace-only strings
+                    inject_clients_list = cast(list[Any], inject_clients_config)
+                    inject_clients = [str(c).strip() for c in inject_clients_list if str(c).strip()]
+                    if meta['debug']:
+                        console.print(f"[cyan]DEBUG: Using injecting_client_list from config: {inject_clients}[/cyan]")
+                else:
+                    inject_clients = []
+            except Exception as e:
+                if meta['debug']:
+                    console.print(f"[cyan]DEBUG: Error reading injecting_client_list from config: {e}[/cyan]")
+
+            if not inject_clients:
+                default_client = self.config['DEFAULT'].get('default_torrent_client')
+                if isinstance(default_client, str) and default_client != 'none':
+                    if meta['debug']:
+                        console.print(f"[cyan]DEBUG: Falling back to default_torrent_client: {default_client}[/cyan]")
+                    inject_clients = [default_client]
+
+        if not inject_clients:
+            if meta['debug']:
+                console.print("[cyan]DEBUG: No clients configured for injecting[/cyan]")
+            return
 
         if meta['debug']:
-            console.print(f"[bold green]Adding to {torrent_client}")
-        if torrent_client.lower() == "rtorrent":
-            self.rtorrent(meta['path'], torrent_path, torrent, meta, local_path, remote_path, client, tracker)
-        elif torrent_client == "qbit":
-            await self.qbittorrent(meta['path'], torrent, local_path, remote_path, client, meta['is_disc'], meta['filelist'], meta, tracker)
-        elif torrent_client.lower() == "deluge":
-            if meta['type'] == "DISC":
-                path = os.path.dirname(meta['path'])  # noqa F841
-            self.deluge(meta['path'], torrent_path, torrent, local_path, remote_path, client, meta)
-        elif torrent_client.lower() == "transmission":
-            self.transmission(meta['path'], torrent, local_path, remote_path, client, meta)
-        elif torrent_client.lower() == "watch":
-            shutil.copy(torrent_path, client['watch_folder'])
+            console.print(f"[cyan]DEBUG: Clients to inject into: {inject_clients}[/cyan]")
+
+        for client_name in inject_clients:
+            if client_name == "none" or not client_name:
+                continue
+
+            if client_name not in self.config['TORRENT_CLIENTS']:
+                console.print(f"[bold red]Torrent client '{client_name}' not found in config.")
+                continue
+
+            client = self.config['TORRENT_CLIENTS'][client_name]
+            torrent_client = client['torrent_client']
+            await self.inject_delay(meta, tracker, client_name)
+
+            # Must pass client_name to remote_path_map
+            local_path, remote_path = await self.remote_path_map(meta, client_name)
+
+            if meta['debug']:
+                console.print(f"[bold green]Adding to {client_name} ({torrent_client})")
+
+            try:
+                if torrent_client.lower() == "rtorrent":
+                    self.rtorrent(meta['path'], torrent_path, torrent, meta, local_path, remote_path, client, tracker)
+                elif torrent_client == "qbit":
+                    await self.qbittorrent(meta['path'], torrent, local_path, remote_path, client, meta['is_disc'], meta['filelist'], meta, tracker, cross)
+                elif torrent_client.lower() == "deluge":
+                    self.deluge(meta['path'], torrent_path, torrent, local_path, remote_path, client, meta)
+                elif torrent_client.lower() == "transmission":
+                    self.transmission(meta['path'], torrent, local_path, remote_path, client, meta)
+                elif torrent_client.lower() == "watch":
+                    shutil.copy(torrent_path, client['watch_folder'])
+            except Exception as e:
+                console.print(f"[bold red]Failed to add torrent to {client_name}: {e}")
         return
 
-    async def find_existing_torrent(self, meta):
-        if meta.get('client', None) is None:
-            default_torrent_client = self.config['DEFAULT']['default_torrent_client']
-        else:
-            default_torrent_client = meta['client']
-        if meta.get('client', None) == 'none' or default_torrent_client == 'none':
-            return None
+    async def inject_delay(self, meta: dict[str, Any], tracker: str, client_name: str) -> None:
+        """
+        Applies an optional delay before injecting a torrent into the client.
 
-        client = self.config['TORRENT_CLIENTS'][default_torrent_client]
-        torrent_storage_dir = client.get('torrent_storage_dir')
-        torrent_client = client.get('torrent_client', '').lower()
-        mtv_config = self.config['TRACKERS'].get('MTV')
+        The delay can be configured either per tracker or globally in the default settings.
+        When both are defined, the tracker-specific value takes precedence over the client setting.
+
+        This mechanism exists to handle cases where a tracker requires a short amount
+        of time to register the uploaded torrent hash. Injecting the torrent too early
+        may cause connectivity issues, such as failing to discover peers even though
+        they are already available.
+
+        By waiting before injection, this function helps ensure proper tracker
+        synchronization and more reliable peer discovery.
+        """
+        tracker_cfg = self.config.get("TRACKERS", {}).get(tracker, {})
+        has_tracker_delay = isinstance(tracker_cfg, dict) and "inject_delay" in tracker_cfg
+        inject_delay = tracker_cfg.get("inject_delay") if has_tracker_delay else self.config["DEFAULT"].get("inject_delay", 0)
+        if inject_delay is not None:
+            try:
+                inject_delay = int(inject_delay)
+            except (ValueError, TypeError):
+                if has_tracker_delay:
+                    console.print(f"{tracker}: [bold red]CONFIG ERROR: 'inject_delay' must be an integer")
+                else:
+                    console.print("[bold red]CONFIG ERROR: 'inject_delay' must be an integer")
+                inject_delay = 0
+
+            if inject_delay < 0:
+                console.print("[bold red]CONFIG ERROR: 'inject_delay' must be >= 0")
+                inject_delay = 0
+            if inject_delay > 0:
+                if meta["debug"] or inject_delay > 5:
+                    if has_tracker_delay:
+                        console.print(f"{tracker}: [cyan]Waiting {inject_delay} seconds before adding to client '{client_name}'[/cyan]")
+                    else:
+                        console.print(f"[cyan]Waiting {inject_delay} seconds before adding to client '{client_name}'[/cyan]")
+                await asyncio.sleep(inject_delay)
+
+    async def find_existing_torrent(self, meta: dict[str, Any]) -> Optional[str]:
+        # Determine piece size preferences
+        trackers_config = cast(dict[str, Any], self.config.get('TRACKERS', {}))
+        mtv_config = trackers_config.get('MTV', {})
+        piece_limit = bool(self.config['DEFAULT'].get('prefer_max_16_torrent', False))
+        mtv_torrent = False
         if isinstance(mtv_config, dict):
-            prefer_small_pieces = mtv_config.get('prefer_mtv_torrent', False)
+            mtv_config_dict = cast(dict[str, Any], mtv_config)
+            mtv_torrent = bool(mtv_config_dict.get('prefer_mtv_torrent', False))
+            prefer_small_pieces = mtv_torrent
         else:
-            prefer_small_pieces = False
+            prefer_small_pieces = bool(piece_limit)
         best_match = None  # Track the best match for fallback if prefer_small_pieces is enabled
+
+        default_torrent_client = cast(str, self.config['DEFAULT']['default_torrent_client'])
+
+        clients_to_search: list[str]
+        meta_client = meta.get('client')
+        if isinstance(meta_client, str) and meta_client != 'none':
+            clients_to_search = [meta_client]
+            if meta['debug']:
+                console.print(f"[cyan]DEBUG: Using client from meta: {clients_to_search}[/cyan]")
+        else:
+            searching_list = self.config['DEFAULT'].get('searching_client_list', [])
+            searching_list_values = cast(list[Any], searching_list) if isinstance(searching_list, list) else []
+
+            if searching_list_values:
+                clients_to_search = [str(c) for c in searching_list_values if str(c) and str(c) != 'none']
+                if meta['debug']:
+                    console.print(f"[cyan]DEBUG: Using searching_client_list from config: {clients_to_search}[/cyan]")
+            else:
+                clients_to_search = []
+
+            if not clients_to_search:
+                if default_torrent_client and default_torrent_client != 'none':
+                    clients_to_search = [default_torrent_client]
+                    if meta['debug']:
+                        console.print(f"[cyan]DEBUG: Falling back to default_torrent_client: {default_torrent_client}[/cyan]")
+                else:
+                    console.print("[yellow]No clients configured for searching...[/yellow]")
+                    return None
+
+        for client_name in clients_to_search:
+            if client_name not in self.config['TORRENT_CLIENTS']:
+                console.print(f"[yellow]Client '{client_name}' not found in TORRENT_CLIENTS config, skipping...")
+                continue
+
+            result = await self._search_single_client_for_torrent(
+                meta, client_name, prefer_small_pieces, mtv_torrent, piece_limit, best_match
+            )
+
+            if result:
+                if isinstance(result, dict):
+                    # Got a valid torrent but not ideal piece size
+                    best_match = result
+                    # If prefer_small_pieces is False, we don't care about piece size optimization
+                    # so stop searching after finding the first valid torrent
+                    if not prefer_small_pieces:
+                        console.print(f"[green]Found valid torrent in client '{client_name}', stopping search[/green]")
+                        torrent_path = best_match.get('torrent_path')
+                        return torrent_path if isinstance(torrent_path, str) else None
+                else:
+                    # Got a path - this means we found a torrent with ideal piece size
+                    console.print(f"[green]Found valid torrent with preferred piece size in client '{client_name}', stopping search[/green]")
+                    return result
+
+        if prefer_small_pieces and best_match:
+            console.print(f"[yellow]Using best match torrent with hash: [bold yellow]{best_match['torrenthash']}[/bold yellow]")
+            torrent_path = best_match.get('torrent_path')
+            return torrent_path if isinstance(torrent_path, str) else None
+
+        console.print("[bold yellow]No Valid .torrent found")
+        return None
+
+    async def _search_single_client_for_torrent(self, meta: dict[str, Any], client_name: str, prefer_small_pieces: bool, mtv_torrent: bool, piece_limit: bool, best_match: Optional[dict[str, Any]]) -> Union[dict[str, Any], str, None]:
+        """Search a single client for an existing torrent by hash or via API search (qbit only)."""
+
+        client = self.config['TORRENT_CLIENTS'][client_name]
+        torrent_client = client.get('torrent_client', '').lower()
+        torrent_storage_dir = client.get('torrent_storage_dir')
+        qbt_client: Optional[qbittorrentapi.Client] = None
+        proxy_url: Optional[str] = None
 
         # Iterate through pre-specified hashes
         for hash_key in ['torrenthash', 'ext_torrenthash']:
             hash_value = meta.get(hash_key)
             if hash_value:
+                hash_value_str = str(hash_value)
                 # If no torrent_storage_dir defined, use saved torrent from qbit
                 extracted_torrent_dir = os.path.join(meta.get('base_dir', ''), "tmp", meta.get('uuid', ''))
 
                 if torrent_storage_dir:
-                    torrent_path = os.path.join(torrent_storage_dir, f"{hash_value}.torrent")
+                    torrent_path = os.path.join(torrent_storage_dir, f"{hash_value_str}.torrent")
                 else:
-                    # Fetch from qBittorrent since we don't have torrent_storage_dir
-                    console.print(f"[yellow]Fetching .torrent file from qBittorrent for hash: {hash_value}")
+                    if torrent_client != 'qbit':
+                        return None
 
                     try:
-                        qbt_client = qbittorrentapi.Client(
-                            host=client['qbit_url'],
-                            port=client['qbit_port'],
-                            username=client['qbit_user'],
-                            password=client['qbit_pass'],
-                            VERIFY_WEBUI_CERTIFICATE=client.get('VERIFY_WEBUI_CERTIFICATE', True)
-                        )
-                        qbt_client.auth_log_in()
+                        proxy_url = client.get('qui_proxy_url')
+                        if proxy_url:
+                            qbt_proxy_url = proxy_url.rstrip('/')
+                            async with aiohttp.ClientSession() as session:
+                                try:
+                                    async with session.post(f"{qbt_proxy_url}/api/v2/torrents/export",
+                                                            data={'hash': hash_value_str}) as response:
+                                        if response.status == 200:
+                                            torrent_file_content = await response.read()
+                                        else:
+                                            console.print(f"[red]Failed to export torrent via proxy: {response.status}")
+                                            continue
+                                except Exception as e:
+                                    console.print(f"[red]Error exporting torrent via proxy: {e}")
+                                    continue
+                        else:
+                            potential_qbt_client = await self.init_qbittorrent_client(client)
+                            if not potential_qbt_client:
+                                continue
+                            else:
+                                qbt_client = potential_qbt_client
 
-                        # Retrieve the .torrent file
-                        torrent_file_content = qbt_client.torrents_export(torrent_hash=hash_value)
+                            qbt_client_local: qbittorrentapi.Client = qbt_client
+
+                            try:
+                                torrent_file_content = await self.retry_qbt_operation(
+                                    lambda qbt_client_local=qbt_client_local, hash_value_str=hash_value_str: asyncio.to_thread(
+                                        qbt_client_local.torrents_export, torrent_hash=hash_value_str
+                                    ),
+                                    f"Export torrent {hash_value_str}"
+                                )
+                            except (asyncio.TimeoutError, qbittorrentapi.APIError):
+                                continue
                         if not torrent_file_content:
-                            console.print(f"[bold red]qBittorrent returned an empty response for hash {hash_value}")
+                            console.print(f"[bold red]qBittorrent returned an empty response for hash {hash_value_str}")
                             continue  # Skip to the next hash
 
                         # Save the .torrent file
                         os.makedirs(extracted_torrent_dir, exist_ok=True)
-                        torrent_path = os.path.join(extracted_torrent_dir, f"{hash_value}.torrent")
+                        torrent_path = os.path.join(extracted_torrent_dir, f"{hash_value_str}.torrent")
 
-                        with open(torrent_path, "wb") as f:
-                            f.write(torrent_file_content)
+                        await asyncio.to_thread(Path(torrent_path).write_bytes, torrent_file_content)
 
                         console.print(f"[green]Successfully saved .torrent file: {torrent_path}")
 
                     except qbittorrentapi.APIError as e:
-                        console.print(f"[bold red]Failed to fetch .torrent from qBittorrent for hash {hash_value}: {e}")
+                        console.print(f"[bold red]Failed to fetch .torrent from qBittorrent for hash {hash_value_str}: {e}")
                         continue
 
                 # Validate the .torrent file
-                valid, resolved_path = await self.is_valid_torrent(meta, torrent_path, hash_value, torrent_client, client, print_err=True)
+                valid, resolved_path = await self.is_valid_torrent(meta, torrent_path, hash_value_str, torrent_client, client)
 
                 if valid:
-                    console.print(f"[green]Found a valid torrent: [bold yellow]{hash_value}")
                     return resolved_path
 
         # Search the client if no pre-specified hash matches
         if torrent_client == 'qbit' and client.get('enable_search'):
+            qbt_session: Optional[aiohttp.ClientSession] = None
             try:
-                found_hash = await self.search_qbit_for_torrent(meta, client)
+
+                proxy_url = client.get('qui_proxy_url')
+
+                if proxy_url:
+                    ssl_context = self.create_ssl_context_for_client(client)
+                    qbt_session = aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=10),
+                        connector=aiohttp.TCPConnector(ssl=ssl_context)
+                    )
+                else:
+                    qbt_client = await self.init_qbittorrent_client(client)
+
+                found_hash = await self.search_qbit_for_torrent(meta, client, qbt_client, qbt_session, proxy_url)
+
+                # Clean up session if we created one
+                if qbt_session:
+                    await qbt_session.close()
+
             except KeyboardInterrupt:
                 console.print("[bold red]Search cancelled by user")
                 found_hash = None
+                if qbt_session:
+                    await qbt_session.close()
+            except asyncio.TimeoutError:
+                if qbt_session:
+                    await qbt_session.close()
+                raise
             except Exception as e:
                 console.print(f"[bold red]Error searching qBittorrent: {e}")
                 found_hash = None
+                if qbt_session:
+                    await qbt_session.close()
             if found_hash:
                 extracted_torrent_dir = os.path.join(meta.get('base_dir', ''), "tmp", meta.get('uuid', ''))
-                found_torrent_path = os.path.join(torrent_storage_dir, f"{found_hash}.torrent") if torrent_storage_dir else os.path.join(extracted_torrent_dir, f"{found_hash}.torrent")
 
-                valid, resolved_path = await self.is_valid_torrent(
-                    meta, found_torrent_path, found_hash, torrent_client, client, print_err=False
-                )
+                if torrent_storage_dir:
+                    found_torrent_path = os.path.join(torrent_storage_dir, f"{found_hash}.torrent")
+                else:
+                    found_torrent_path = os.path.join(extracted_torrent_dir, f"{found_hash}.torrent")
+
+                    if not os.path.exists(found_torrent_path):
+                        console.print(f"[yellow]Exporting .torrent file from qBittorrent for hash: {found_hash}[/yellow]")
+
+                        torrent_file_content: Optional[bytes] = None
+
+                        try:
+                            proxy_url = client.get('qui_proxy_url')
+                            if proxy_url:
+                                qbt_proxy_url = proxy_url.rstrip('/')
+                                async with aiohttp.ClientSession() as session:
+                                    try:
+                                        async with session.post(f"{qbt_proxy_url}/api/v2/torrents/export",
+                                                                data={'hash': found_hash}) as response:
+                                            if response.status == 200:
+                                                torrent_file_content = await response.read()
+                                            else:
+                                                console.print(f"[red]Failed to export torrent via proxy: {response.status}")
+                                                found_hash = None
+                                    except Exception as e:
+                                        console.print(f"[red]Error exporting torrent via proxy: {e}")
+                                        found_hash = None
+                            else:
+                                # Reuse or create qbt_client if needed
+                                if qbt_client is None:
+                                    qbt_client = qbittorrentapi.Client(
+                                        host=client['qbit_url'],
+                                        port=client['qbit_port'],
+                                        username=client['qbit_user'],
+                                        password=client['qbit_pass'],
+                                        VERIFY_WEBUI_CERTIFICATE=client.get('VERIFY_WEBUI_CERTIFICATE', True)
+                                    )
+                                    try:
+                                        await self.retry_qbt_operation(
+                                            lambda: asyncio.to_thread(qbt_client.auth_log_in),
+                                            "qBittorrent login"
+                                        )
+                                    except (asyncio.TimeoutError, qbittorrentapi.LoginFailed, qbittorrentapi.APIConnectionError) as e:
+                                        console.print(f"[bold red]Failed to connect to qBittorrent for export: {e}")
+                                        found_hash = None
+
+                                if found_hash:  # Only proceed if we still have a hash
+                                    try:
+                                        torrent_file_content = await self.retry_qbt_operation(
+                                            lambda qbt_client=qbt_client, found_hash=found_hash: asyncio.to_thread(
+                                                qbt_client.torrents_export, torrent_hash=found_hash
+                                            ),
+                                            f"Export torrent {found_hash}"
+                                        )
+                                    except (asyncio.TimeoutError, qbittorrentapi.APIError) as e:
+                                        console.print(f"[red]Error exporting torrent: {e}")
+
+                            if found_hash:  # Only proceed if export succeeded
+                                if not torrent_file_content:
+                                    found_hash = None
+                                else:
+                                    os.makedirs(extracted_torrent_dir, exist_ok=True)
+                                    await asyncio.to_thread(Path(found_torrent_path).write_bytes, torrent_file_content)
+                                    console.print(f"[green]Successfully saved .torrent file: {found_torrent_path}")
+                        except Exception as e:
+                            console.print(f"[bold red]Unexpected error fetching .torrent from qBittorrent: {e}")
+                            console.print("[cyan]DEBUG: Skipping found_hash due to unexpected error[/cyan]")
+                            found_hash = None
+                    else:
+                        console.print(f"[cyan]DEBUG: .torrent file already exists at {found_torrent_path}[/cyan]")
+
+                # Only validate if we still have a hash (export succeeded or file already existed)
+                resolved_path = ""
+                if found_hash:
+                    valid, resolved_path = await self.is_valid_torrent(
+                        meta, found_torrent_path, found_hash, torrent_client, client
+                    )
+                else:
+                    valid = False
+                    console.print("[cyan]DEBUG: Skipping validation because found_hash is None[/cyan]")
 
                 if valid:
                     torrent = Torrent.read(resolved_path)
@@ -160,25 +506,26 @@ class Clients():
                         return resolved_path
 
                     # Track best match for small pieces
-                    if piece_size <= 8388608:
+                    if piece_size <= 8388608 and mtv_torrent:
                         console.print(f"[green]Found a valid torrent with preferred piece size from client search: [bold yellow]{found_hash}")
+                        return resolved_path
+
+                    if piece_size < 16777216 and piece_limit:  # 16 MiB
+                        console.print(f"[green]Found a valid torrent with piece size under 16 MiB from client search: [bold yellow]{found_hash}")
                         return resolved_path
 
                     if best_match is None or piece_size < best_match['piece_size']:
                         best_match = {'torrenthash': found_hash, 'torrent_path': resolved_path, 'piece_size': piece_size}
                         console.print(f"[yellow]Storing valid torrent from client search as best match: [bold yellow]{found_hash}")
 
-        # Use best match if no preferred torrent found
-        if prefer_small_pieces and best_match:
-            console.print(f"[yellow]Using best match torrent with hash: [bold yellow]{best_match['torrenthash']}[/bold yellow]")
-            return best_match['torrent_path']
+        return best_match
 
-        console.print("[bold yellow]No Valid .torrent found")
-        return None
-
-    async def is_valid_torrent(self, meta, torrent_path, torrenthash, torrent_client, client, print_err=False):
+    async def is_valid_torrent(self, meta: dict[str, Any], torrent_path: str, torrenthash: str, torrent_client: str, client: dict[str, Any]) -> tuple[bool, str]:
         valid = False
         wrong_file = False
+        filelist = cast(list[str], meta.get('filelist', []))
+        meta_path = str(meta.get('path', ''))
+        meta_uuid = str(meta.get('uuid', ''))
 
         # Normalize the torrent hash based on the client
         if torrent_client in ('qbit', 'deluge'):
@@ -200,20 +547,20 @@ class Clients():
                 return valid, torrent_path
 
             # Reuse if disc and basename matches or --keep-folder was specified
-            if meta.get('is_disc', None) is not None or (meta['keep_folder'] and meta['isdir']):
+            if (meta.get('is_disc') and meta.get('is_disc') != '') or (meta.get('keep_folder', False) and meta.get('isdir', False)):
                 torrent_name = torrent.metainfo['info']['name']
-                if meta['uuid'] != torrent_name and meta['debug']:
+                if meta_uuid != torrent_name and meta['debug']:
                     console.print("Modified file structure, skipping hash")
                     valid = False
                 torrent_filepath = os.path.commonpath(torrent.files)
-                if os.path.basename(meta['path']) in torrent_filepath:
+                if os.path.basename(meta_path) in torrent_filepath:
                     valid = True
                 if meta['debug']:
                     console.log(f"Torrent is valid based on disc/basename or keep-folder: {valid}")
 
             # If one file, check for folder
-            elif len(torrent.files) == len(meta['filelist']) == 1:
-                if os.path.basename(torrent.files[0]) == os.path.basename(meta['filelist'][0]):
+            elif len(torrent.files) == len(filelist) == 1:
+                if os.path.basename(torrent.files[0]) == os.path.basename(filelist[0]):
                     if str(torrent.files[0]) == os.path.basename(torrent.files[0]):
                         valid = True
                     else:
@@ -222,12 +569,11 @@ class Clients():
                     console.log(f"Single file match status: valid={valid}, wrong_file={wrong_file}")
 
             # Check if number of files matches number of videos
-            elif len(torrent.files) == len(meta['filelist']):
+            elif len(torrent.files) == len(filelist):
                 torrent_filepath = os.path.commonpath(torrent.files)
-                actual_filepath = os.path.commonpath(meta['filelist'])
-                local_path, remote_path = await self.remote_path_map(meta)
-
-                if local_path.lower() in meta['path'].lower() and local_path.lower() != remote_path.lower():
+                actual_filepath = os.path.commonpath(filelist)
+                local_path, remote_path = await self.remote_path_map(meta, client)
+                if local_path.lower() in meta_path.lower() and local_path.lower() != remote_path.lower():
                     actual_filepath = actual_filepath.replace(local_path, remote_path).replace(os.sep, '/')
 
                 if meta['debug']:
@@ -255,15 +601,15 @@ class Clients():
                         console.log(f"Checking piece size, count and size: pieces={reuse_torrent.pieces}, piece_size={piece_in_mib} MiB, .torrent size={torrent_file_size_kib} KiB")
 
                     # Piece size and count validations
-                    if not meta.get('prefer_small_pieces', False):
-                        if reuse_torrent.pieces >= 8000 and reuse_torrent.piece_size < 8488608:
-                            if meta['debug']:
-                                console.print("[bold red]Torrent needs to have less than 8000 pieces with a 8 MiB piece size")
-                            valid = False
-                        elif reuse_torrent.pieces >= 4000 and reuse_torrent.piece_size < 4294304:
-                            if meta['debug']:
-                                console.print("[bold red]Torrent needs to have less than 5000 pieces with a 4 MiB piece size")
-                            valid = False
+                    max_piece_size = meta.get('max_piece_size')
+                    if reuse_torrent.pieces >= 5000 and reuse_torrent.piece_size < 4294304 and (max_piece_size is None or max_piece_size >= 4):
+                        if meta['debug']:
+                            console.print("[bold red]Torrent needs to have less than 5000 pieces with a 4 MiB piece size")
+                        valid = False
+                    elif reuse_torrent.pieces >= 8000 and reuse_torrent.piece_size < 8488608 and (max_piece_size is None or max_piece_size >= 8) and not meta.get('prefer_small_pieces', False):
+                        if meta['debug']:
+                            console.print("[bold red]Torrent needs to have less than 8000 pieces with a 8 MiB piece size")
+                        valid = False
                     elif 'max_piece_size' not in meta and reuse_torrent.pieces >= 12000:
                         if meta['debug']:
                             console.print("[bold red]Torrent needs to have less than 12000 pieces to be valid")
@@ -281,7 +627,8 @@ class Clients():
                             console.log("[bold red]Provided .torrent has files that were not expected")
                         valid = False
                     else:
-                        console.print(f"[bold green]REUSING .torrent with infohash: [bold yellow]{torrenthash}")
+                        if meta['debug']:
+                            console.log(f"[bold green]REUSING .torrent with infohash: [bold yellow]{torrenthash}")
                 except Exception as e:
                     console.print(f'[bold red]Error checking reuse torrent: {e}')
                     valid = False
@@ -294,899 +641,38 @@ class Clients():
 
         return valid, torrent_path
 
-    async def search_qbit_for_torrent(self, meta, client):
-        mtv_config = self.config['TRACKERS'].get('MTV')
-        if isinstance(mtv_config, dict):
-            prefer_small_pieces = mtv_config.get('prefer_mtv_torrent', False)
-        else:
-            prefer_small_pieces = False
-        console.print("[green]Searching qBittorrent for an existing .torrent")
-
-        torrent_storage_dir = client.get('torrent_storage_dir')
-        extracted_torrent_dir = os.path.join(meta.get('base_dir', ''), "tmp", meta.get('uuid', ''))
-
-        if not extracted_torrent_dir or extracted_torrent_dir.strip() == "tmp/":
-            console.print("[bold red]Invalid extracted torrent directory path. Check `meta['base_dir']` and `meta['uuid']`.")
-            return None
-
-        try:
-            qbt_client = qbittorrentapi.Client(
-                host=client['qbit_url'],
-                port=client['qbit_port'],
-                username=client['qbit_user'],
-                password=client['qbit_pass'],
-                VERIFY_WEBUI_CERTIFICATE=client.get('VERIFY_WEBUI_CERTIFICATE', True)
-            )
-            qbt_client.auth_log_in()
-
-        except qbittorrentapi.LoginFailed:
-            console.print("[bold red]INCORRECT QBIT LOGIN CREDENTIALS")
-            return None
-        except qbittorrentapi.APIConnectionError:
-            console.print("[bold red]APIConnectionError: INCORRECT HOST/PORT")
-            return None
-
-        # Ensure extracted torrent directory exists
-        os.makedirs(extracted_torrent_dir, exist_ok=True)
-
-        # **Step 1: Find correct torrents using content_path**
-        best_match = None
-        matching_torrents = []
-
-        for torrent in qbt_client.torrents.info():
+    async def remote_path_map(self, meta: dict[str, Any], torrent_client_name: Optional[Union[str, dict[str, Any]]] = None) -> tuple[str, str]:
+        if isinstance(torrent_client_name, dict):
+            client_config: dict[str, Any] = torrent_client_name
+        elif isinstance(torrent_client_name, str) and torrent_client_name:
             try:
-                torrent_path = torrent.name
-            except AttributeError:
-                continue  # Ignore torrents with missing attributes
-
-            if meta['is_disc'] in ("", None) and len(meta['filelist']) == 1:
-                if torrent_path != meta['uuid'] or len(torrent.files) != len(meta['filelist']):
-                    continue
-
-            elif meta['uuid'] != torrent_path:
-                continue
-
-            if meta['debug']:
-                console.print(f"[cyan]Matched Torrent: {torrent.hash}")
-                console.print(f"Name: {torrent.name}")
-                console.print(f"Save Path: {torrent.save_path}")
-                console.print(f"Content Path: {torrent_path}")
-
-            matching_torrents.append({'hash': torrent.hash, 'name': torrent.name})
-
-        if not matching_torrents:
-            console.print("[yellow]No matching torrents found in qBittorrent.")
-            return None
-
-        console.print(f"[green]Total Matching Torrents: {len(matching_torrents)}")
-
-        # **Step 2: Extract and Save .torrent Files**
-        processed_hashes = set()
-        best_match = None
-
-        for torrent in matching_torrents:
-            try:
-                torrent_hash = torrent['hash']
-                if torrent_hash in processed_hashes:
-                    continue  # Avoid processing duplicates
-
-                processed_hashes.add(torrent_hash)
-
-            except Exception as e:
-                console.print(f"[bold red]Unexpected error while handling {torrent_hash}: {e}")
-
-            # **Use `torrent_storage_dir` if available**
-            if torrent_storage_dir:
-                torrent_file_path = os.path.join(torrent_storage_dir, f"{torrent_hash}.torrent")
-                if not os.path.exists(torrent_file_path):
-                    console.print(f"[yellow]Torrent file not found in storage directory: {torrent_file_path}")
-                    continue
-            else:
-                # **Fetch from qBittorrent API if no `torrent_storage_dir`**
-                if meta['debug']:
-                    console.print(f"[cyan]Exporting .torrent file for {torrent_hash}")
-
-                try:
-                    torrent_file_content = qbt_client.torrents_export(torrent_hash=torrent_hash)
-                    torrent_file_path = os.path.join(extracted_torrent_dir, f"{torrent_hash}.torrent")
-
-                    with open(torrent_file_path, "wb") as f:
-                        f.write(torrent_file_content)
-                    if meta['debug']:
-                        console.print(f"[green]Successfully saved .torrent file: {torrent_file_path}")
-
-                except qbittorrentapi.APIError as e:
-                    console.print(f"[bold red]Failed to export .torrent for {torrent_hash}: {e}")
-                    continue  # Skip this torrent if unable to fetch
-
-            # **Validate the .torrent file**
-            try:
-                valid, torrent_path = await self.is_valid_torrent(meta, torrent_file_path, torrent_hash, 'qbit', client, print_err=False)
-            except Exception as e:
-                console.print(f"[bold red]Error validating torrent {torrent_hash}: {e}")
-                valid = False
-                torrent_path = None
-
-            if valid:
-                console.print("prefersmallpieces", prefer_small_pieces)
-                if prefer_small_pieces:
-                    # **Track best match based on piece size**
-                    try:
-                        torrent_data = Torrent.read(torrent_file_path)
-                        piece_size = torrent_data.piece_size
-                        if best_match is None or piece_size < best_match['piece_size']:
-                            best_match = {
-                                'hash': torrent_hash,
-                                'torrent_path': torrent_path if torrent_path else torrent_file_path,
-                                'piece_size': piece_size
-                            }
-                            console.print(f"[green]Updated best match: {best_match}")
-                    except Exception as e:
-                        console.print(f"[bold red]Error reading torrent data for {torrent_hash}: {e}")
-                        continue
-                else:
-                    # If `prefer_small_pieces` is False, return first valid torrent
-                    console.print(f"[green]Returning first valid torrent: {torrent_hash}")
-                    return torrent_hash
-            else:
-                if meta['debug']:
-                    console.print(f"[bold red]{torrent_hash} failed validation")
-                os.remove(torrent_file_path)
-
-        # **Return the best match if `prefer_small_pieces` is enabled**
-        if best_match:
-            console.print(f"[green]Using best match torrent with hash: {best_match['hash']}")
-            return best_match['hash']
-
-        console.print("[yellow]No valid torrents found.")
-        return None
-
-    def rtorrent(self, path, torrent_path, torrent, meta, local_path, remote_path, client, tracker):
-        # Get the appropriate source path (same as in qbittorrent method)
-        if len(meta.get('filelist', [])) == 1 and os.path.isfile(meta['filelist'][0]) and not meta.get('keep_folder'):
-            # If there's a single file and not keep_folder, use the file itself as the source
-            src = meta['filelist'][0]
+                client_config = cast(dict[str, Any], self.config['TORRENT_CLIENTS'][torrent_client_name])
+            except KeyError as exc:
+                raise KeyError(f"Torrent client '{torrent_client_name}' not found in TORRENT_CLIENTS") from exc
         else:
-            # Otherwise, use the directory
-            src = meta.get('path')
-
-        if not src:
-            error_msg = "[red]No source path found in meta."
-            console.print(f"[bold red]{error_msg}")
-            raise ValueError(error_msg)
-
-        # Determine linking method
-        linking_method = client.get('linking', None)  # "symlink", "hardlink", or None
-        if meta.get('debug', False):
-            console.print("Linking method:", linking_method)
-        use_symlink = linking_method == "symlink"
-        use_hardlink = linking_method == "hardlink"
-
-        if use_symlink and use_hardlink:
-            error_msg = "Cannot use both hard links and symlinks simultaneously"
-            console.print(f"[bold red]{error_msg}")
-            raise ValueError(error_msg)
-
-        # Process linking if enabled
-        if use_symlink or use_hardlink:
-            # Get linked folder for this drive
-            linked_folder = client.get('linked_folder', [])
-            if meta.get('debug', False):
-                console.print(f"Linked folders: {linked_folder}")
-            if not isinstance(linked_folder, list):
-                linked_folder = [linked_folder]  # Convert to list if single value
-
-            # Determine drive letter (Windows) or root (Linux)
-            if platform.system() == "Windows":
-                src_drive = os.path.splitdrive(src)[0]
-            else:
-                # On Unix/Linux, use the root directory or first directory component
-                src_drive = "/"
-                # Extract the first directory component for more specific matching
-                src_parts = src.strip('/').split('/')
-                if src_parts:
-                    src_root_dir = '/' + src_parts[0]
-                    # Check if any linked folder contains this root
-                    for folder in linked_folder:
-                        if src_root_dir in folder or folder in src_root_dir:
-                            src_drive = src_root_dir
-                            break
-
-            # Find a linked folder that matches the drive
-            link_target = None
-            if platform.system() == "Windows":
-                # Windows matching based on drive letters
-                for folder in linked_folder:
-                    folder_drive = os.path.splitdrive(folder)[0]
-                    if folder_drive == src_drive:
-                        link_target = folder
-                        break
-            else:
-                # Unix/Linux matching based on path containment
-                for folder in linked_folder:
-                    # Check if source path is in the linked folder or vice versa
-                    if src.startswith(folder) or folder.startswith(src) or folder.startswith(src_drive):
-                        link_target = folder
-                        break
-
-            if meta.get('debug', False):
-                console.print(f"Source drive: {src_drive}")
-                console.print(f"Link target: {link_target}")
-
-            # If using symlinks and no matching drive folder, allow any available one
-            if use_symlink and not link_target and linked_folder:
-                link_target = linked_folder[0]
-
-            if (use_symlink or use_hardlink) and not link_target:
-                error_msg = f"No suitable linked folder found for drive {src_drive}"
-                console.print(f"[bold red]{error_msg}")
-                raise ValueError(error_msg)
-
-            # Create tracker-specific directory inside linked folder
-            if use_symlink or use_hardlink:
-                # allow overridden folder name with link_dir_name config var
-                tracker_cfg = self.config["TRACKERS"].get(tracker.upper(), {})
-                link_dir_name = str(tracker_cfg.get("link_dir_name", "")).strip()
-                tracker_dir = os.path.join(link_target, link_dir_name or tracker)
-                os.makedirs(tracker_dir, exist_ok=True)
-
-                if meta.get('debug', False):
-                    console.print(f"[bold yellow]Linking to tracker directory: {tracker_dir}")
-                    console.print(f"[cyan]Source path: {src}")
-
-                # Extract only the folder or file name from `src`
-                src_name = os.path.basename(src.rstrip(os.sep))  # Ensure we get just the name
-                dst = os.path.join(tracker_dir, src_name)  # Destination inside linked folder
-
-                # path magic
-                if os.path.exists(dst) or os.path.islink(dst):
-                    if meta.get('debug', False):
-                        console.print(f"[yellow]Skipping linking, path already exists: {dst}")
-                else:
-                    if use_hardlink:
-                        try:
-                            # Check if we're linking a file or directory
-                            if os.path.isfile(src):
-                                # For a single file, create a hardlink directly
-                                try:
-                                    os.link(src, dst)
-                                    if meta.get('debug', False):
-                                        console.print(f"[green]Hard link created: {dst} -> {src}")
-                                except OSError as e:
-                                    # If hardlink fails, try to copy the file instead
-                                    console.print(f"[yellow]Hard link failed: {e}")
-                                    console.print(f"[yellow]Falling back to file copy for: {src}")
-                                    shutil.copy2(src, dst)  # copy2 preserves metadata
-                                    console.print(f"[green]File copied instead: {dst}")
-                            else:
-                                # For directories, we need to link each file inside
-                                os.makedirs(dst, exist_ok=True)
-
-                                for root, _, files in os.walk(src):
-                                    # Get the relative path from source
-                                    rel_path = os.path.relpath(root, src)
-
-                                    # Create corresponding directory in destination
-                                    if rel_path != '.':
-                                        dst_dir = os.path.join(dst, rel_path)
-                                        os.makedirs(dst_dir, exist_ok=True)
-
-                                    # Create hardlinks for each file
-                                    for file in files:
-                                        src_file = os.path.join(root, file)
-                                        dst_file = os.path.join(dst if rel_path == '.' else dst_dir, file)
-                                        try:
-                                            os.link(src_file, dst_file)
-                                            if meta.get('debug', False) and files.index(file) == 0:
-                                                console.print(f"[green]Hard link created for file: {dst_file} -> {src_file}")
-                                        except OSError as e:
-                                            # If hardlink fails, copy file instead
-                                            console.print(f"[yellow]Hard link failed for file {file}: {e}")
-                                            shutil.copy2(src_file, dst_file)  # copy2 preserves metadata
-                                            console.print(f"[yellow]File copied instead: {dst_file}")
-
-                                if meta.get('debug', False):
-                                    console.print(f"[green]Directory structure and files processed: {dst}")
-                        except OSError as e:
-                            error_msg = f"Failed to create link: {e}"
-                            console.print(f"[bold red]{error_msg}")
-                            if meta.get('debug', False):
-                                console.print(f"[yellow]Source: {src} (exists: {os.path.exists(src)})")
-                                console.print(f"[yellow]Destination: {dst}")
-                            # Don't raise exception - just warn and continue
-                            console.print("[yellow]Continuing with rTorrent addition despite linking failure")
-
-                    elif use_symlink:
-                        try:
-                            if platform.system() == "Windows":
-                                os.symlink(src, dst, target_is_directory=os.path.isdir(src))
-                            else:
-                                os.symlink(src, dst)
-
-                            if meta.get('debug', False):
-                                console.print(f"[green]Symbolic link created: {dst} -> {src}")
-
-                        except OSError as e:
-                            error_msg = f"Failed to create symlink: {e}"
-                            console.print(f"[bold red]{error_msg}")
-                            # Don't raise exception - just warn and continue
-                            console.print("[yellow]Continuing with rTorrent addition despite linking failure")
-
-                # Use the linked path for rTorrent if linking was successful
-                if (use_symlink or use_hardlink) and os.path.exists(dst):
-                    path = dst
-
-        # Apply remote pathing to `tracker_dir` before assigning `save_path`
-        if use_symlink or use_hardlink:
-            save_path = tracker_dir  # Default to linked directory
-        else:
-            save_path = path  # Default to the original path
-
-        # Handle remote path mapping
-        if local_path and remote_path and local_path.lower() != remote_path.lower():
-            # Normalize paths for comparison
-            norm_save_path = os.path.normpath(save_path).lower()
-            norm_local_path = os.path.normpath(local_path).lower()
-
-            # Check if the save_path starts with local_path
-            if norm_save_path.startswith(norm_local_path):
-                # Get the relative part of the path
-                rel_path = os.path.relpath(save_path, local_path)
-                # Combine remote path with relative path
-                save_path = os.path.join(remote_path, rel_path)
-
-            # For direct replacement if the above approach doesn't work
-            elif local_path.lower() in save_path.lower():
-                save_path = save_path.replace(local_path, remote_path, 1)  # Replace only at the beginning
-
-        if meta['debug']:
-            console.print(f"[cyan]Original path: {path}")
-            console.print(f"[cyan]Mapped save path: {save_path}")
-
-        rtorrent = xmlrpc.client.Server(client['rtorrent_url'], context=ssl._create_stdlib_context())
-        metainfo = bencode.bread(torrent_path)
-        if meta['debug']:
-            print(f"{rtorrent}: {redact_private_info(rtorrent)}")
-            print(f"{metainfo}: {redact_private_info(metainfo)}")
-        try:
-            # Use dst path if linking was successful, otherwise use original path
-            resume_path = dst if (use_symlink or use_hardlink) and os.path.exists(dst) else path
-            if meta['debug']:
-                console.print(f"[cyan]Using resume path: {resume_path}")
-            fast_resume = self.add_fast_resume(metainfo, resume_path, torrent)
-        except EnvironmentError as exc:
-            console.print("[red]Error making fast-resume data (%s)" % (exc,))
-            raise
-
-        new_meta = bencode.bencode(fast_resume)
-        if new_meta != metainfo:
-            fr_file = torrent_path.replace('.torrent', '-resume.torrent')
-            if meta['debug']:
-                console.print("Creating fast resume file:", fr_file)
-            bencode.bwrite(fast_resume, fr_file)
-
-        # Use dst path if linking was successful, otherwise use original path
-        path = dst if (use_symlink or use_hardlink) and os.path.exists(dst) else path
-
-        isdir = os.path.isdir(path)
-        # Remote path mount
-        modified_fr = False
-        if local_path.lower() in path.lower() and local_path.lower() != remote_path.lower():
-            path_dir = os.path.dirname(path)
-            path = path.replace(local_path, remote_path)
-            path = path.replace(os.sep, '/')
-            shutil.copy(fr_file, f"{path_dir}/fr.torrent")
-            fr_file = f"{os.path.dirname(path)}/fr.torrent"
-            modified_fr = True
-            if meta['debug']:
-                console.print(f"[cyan]Modified fast resume file path because path mapping: {fr_file}")
-        if isdir is False:
-            path = os.path.dirname(path)
-        if meta['debug']:
-            console.print(f"[cyan]Final path for rTorrent: {path}")
-
-        console.print("[bold yellow]Adding and starting torrent")
-        rtorrent.load.start_verbose('', fr_file, f"d.directory_base.set={path}")
-        if meta['debug']:
-            console.print(f"[green]rTorrent load start for {fr_file} with d.directory_base.set={path}")
-        time.sleep(1)
-        # Add labels
-        if client.get('rtorrent_label', None) is not None:
-            if meta['debug']:
-                console.print(f"[cyan]Setting rTorrent label: {client['rtorrent_label']}")
-            rtorrent.d.custom1.set(torrent.infohash, client['rtorrent_label'])
-        if meta.get('rtorrent_label') is not None:
-            rtorrent.d.custom1.set(torrent.infohash, meta['rtorrent_label'])
-            if meta['debug']:
-                console.print(f"[cyan]Setting rTorrent label from meta: {meta['rtorrent_label']}")
-
-        # Delete modified fr_file location
-        if modified_fr:
-            if meta['debug']:
-                console.print(f"[cyan]Removing modified fast resume file: {fr_file}")
-            os.remove(f"{path_dir}/fr.torrent")
-        if meta.get('debug', False):
-            console.print(f"[cyan]Path: {path}")
-        return
-
-    async def qbittorrent(self, path, torrent, local_path, remote_path, client, is_disc, filelist, meta, tracker):
-        if meta.get('keep_folder'):
-            path = os.path.dirname(path)
-        else:
-            isdir = os.path.isdir(path)
-            if len(filelist) != 1 or not isdir:
-                path = os.path.dirname(path)
-
-        # Get the appropriate source path
-        if len(meta['filelist']) == 1 and os.path.isfile(meta['filelist'][0]) and not meta.get('keep_folder'):
-            # If there's a single file and not keep_folder, use the file itself as the source
-            src = meta['filelist'][0]
-        else:
-            # Otherwise, use the directory
-            src = meta.get('path')
-
-        if not src:
-            error_msg = "[red]No source path found in meta."
-            console.print(f"[bold red]{error_msg}")
-            raise ValueError(error_msg)
-
-        # Determine linking method
-        linking_method = client.get('linking', None)  # "symlink", "hardlink", or None
-        if meta['debug']:
-            console.print("Linking method:", linking_method)
-        use_symlink = linking_method == "symlink"
-        use_hardlink = linking_method == "hardlink"
-
-        if use_symlink and use_hardlink:
-            error_msg = "Cannot use both hard links and symlinks simultaneously"
-            console.print(f"[bold red]{error_msg}")
-            raise ValueError(error_msg)
-
-        # Get linked folder for this drive
-        linked_folder = client.get('linked_folder', [])
-        if meta['debug']:
-            console.print(f"Linked folders: {linked_folder}")
-        if not isinstance(linked_folder, list):
-            linked_folder = [linked_folder]  # Convert to list if single value
-
-        # Determine drive letter (Windows) or root (Linux)
-        if platform.system() == "Windows":
-            src_drive = os.path.splitdrive(src)[0]
-        else:
-            # On Unix/Linux, use the full mount point path for more accurate matching
-            src_drive = "/"
-
-            # Get all mount points on the system to find the most specific match
-            mounted_volumes = []
-            try:
-                # Read mount points from /proc/mounts or use 'mount' command output
-                if os.path.exists('/proc/mounts'):
-                    with open('/proc/mounts', 'r') as f:
-                        for line in f:
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                mount_point = parts[1]
-                                mounted_volumes.append(mount_point)
-                else:
-                    # Fall back to mount command if /proc/mounts doesn't exist
-                    import subprocess
-                    output = subprocess.check_output(['mount'], text=True)
-                    for line in output.splitlines():
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            mount_point = parts[2]
-                            mounted_volumes.append(mount_point)
-            except Exception as e:
-                if meta.get('debug', False):
-                    console.print(f"[yellow]Error getting mount points: {str(e)}")
-
-            # Sort mount points by length (descending) to find most specific match first
-            mounted_volumes.sort(key=len, reverse=True)
-
-            # Find the most specific mount point that contains our source path
-            for mount_point in mounted_volumes:
-                if src.startswith(mount_point):
-                    src_drive = mount_point
-                    if meta.get('debug', False):
-                        console.print(f"[cyan]Found mount point: {mount_point} for path: {src}")
-                    break
-
-            # If we couldn't find a specific mount point, fall back to linked folder matching
-            if src_drive == "/":
-                # Extract the first directory component for basic matching
-                src_parts = src.strip('/').split('/')
-                if src_parts:
-                    src_root_dir = '/' + src_parts[0]
-                    # Check if any linked folder contains this root
-                    for folder in linked_folder:
-                        if src_root_dir in folder or folder in src_root_dir:
-                            src_drive = src_root_dir
-                            break
-
-        # Find a linked folder that matches the drive
-        link_target = None
-        if platform.system() == "Windows":
-            # Windows matching based on drive letters
-            for folder in linked_folder:
-                folder_drive = os.path.splitdrive(folder)[0]
-                if folder_drive == src_drive:
-                    link_target = folder
-                    break
-        else:
-            # Unix/Linux matching based on path containment
-            for folder in linked_folder:
-                # Check if the linked folder starts with the mount point
-                if folder.startswith(src_drive) or src.startswith(folder):
-                    link_target = folder
-                    break
-
-                # Also check if this is a sibling mount point with the same structure
-                folder_parts = folder.split('/')
-                src_drive_parts = src_drive.split('/')
-
-                # Check if both are mounted under the same parent directory
-                if (len(folder_parts) >= 2 and len(src_drive_parts) >= 2 and
-                        folder_parts[1] == src_drive_parts[1]):
-
-                    potential_match = os.path.join(src_drive, folder_parts[-1])
-                    if os.path.exists(potential_match):
-                        link_target = potential_match
-                        if meta['debug']:
-                            console.print(f"[cyan]Found sibling mount point linked folder: {link_target}")
-                        break
-
-        if meta['debug']:
-            console.print(f"Source drive: {src_drive}")
-            console.print(f"Link target: {link_target}")
-        # If using symlinks and no matching drive folder, allow any available one
-        if use_symlink and not link_target and linked_folder:
-            link_target = linked_folder[0]
-
-        if (use_symlink or use_hardlink) and not link_target:
-            error_msg = f"No suitable linked folder found for drive {src_drive}"
-            console.print(f"[bold red]{error_msg}")
-            raise ValueError(error_msg)
-
-        # Create tracker-specific directory inside linked folder
-        if use_symlink or use_hardlink:
-            # allow overridden folder name with link_dir_name config var
-            tracker_cfg = self.config["TRACKERS"].get(tracker.upper(), {})
-            link_dir_name = str(tracker_cfg.get("link_dir_name", "")).strip()
-            tracker_dir = os.path.join(link_target, link_dir_name or tracker)
-            os.makedirs(tracker_dir, exist_ok=True)
-
-            if meta['debug']:
-                console.print(f"[bold yellow]Linking to tracker directory: {tracker_dir}")
-                console.print(f"[cyan]Source path: {src}")
-
-            # Extract only the folder or file name from `src`
-            src_name = os.path.basename(src.rstrip(os.sep))  # Ensure we get just the name
-            dst = os.path.join(tracker_dir, src_name)  # Destination inside linked folder
-
-            # path magic
-            if os.path.exists(dst) or os.path.islink(dst):
-                if meta['debug']:
-                    console.print(f"[yellow]Skipping linking, path already exists: {dst}")
-            else:
-                allow_fallback = self.config['TRACKERS'].get('allow_fallback', True)
-                fallback_to_original = False
-                if use_hardlink:
-                    try:
-                        # Check if we're linking a file or directory
-                        if os.path.isfile(src):
-                            # For a single file, create a hardlink directly
-                            try:
-                                os.link(src, dst)
-                                if meta['debug']:
-                                    console.print(f"[green]Hard link created: {dst} -> {src}")
-                            except OSError as e:
-                                console.print(f"[yellow]Hard link failed: {e}")
-                                if allow_fallback:
-                                    console.print(f"[yellow]Using original path without linking: {src}")
-                                    use_hardlink = False
-                                    fallback_to_original = True
-                        else:
-                            # For directories, we need to link each file inside
-                            console.print("[yellow]Cannot hardlink directories directly. Creating directory structure...")
-                            os.makedirs(dst, exist_ok=True)
-
-                            for root, _, files in os.walk(src):
-                                # Get the relative path from source
-                                rel_path = os.path.relpath(root, src)
-
-                                # Create corresponding directory in destination
-                                if rel_path != '.':
-                                    dst_dir = os.path.join(dst, rel_path)
-                                    os.makedirs(dst_dir, exist_ok=True)
-
-                                # Create hardlinks for each file
-                                for file in files:
-                                    src_file = os.path.join(root, file)
-                                    dst_file = os.path.join(dst if rel_path == '.' else dst_dir, file)
-                                    try:
-                                        os.link(src_file, dst_file)
-                                        if meta['debug'] and files.index(file) == 0:
-                                            console.print(f"[green]Hard link created for file: {dst_file} -> {src_file}")
-                                    except OSError as e:
-                                        console.print(f"[yellow]Hard link failed for file {file}: {e}")
-                                        if allow_fallback:
-                                            console.print(f"[yellow]Using original path without linking: {src}")
-                                            fallback_to_original = True
-                                        break
-
-                        if fallback_to_original:
-                            use_hardlink = False
-                            link_target = None
-                            # Clean up the partially created directory
-                            try:
-                                shutil.rmtree(dst)
-                            except Exception as cleanup_error:
-                                console.print(f"[red]Warning: Failed to clean up partial directory {dst}: {cleanup_error}")
-
-                    except OSError as e:
-                        # Global exception handler for any linking operation
-                        error_msg = f"Failed to create hard link: {e}"
-                        console.print(f"[bold red]{error_msg}")
-                        if allow_fallback:
-                            console.print(f"[yellow]Using original path without linking: {src}")
-                            use_hardlink = False
-                            if meta['debug']:
-                                console.print(f"[yellow]Source: {src} (exists: {os.path.exists(src)})")
-                                console.print(f"[yellow]Destination: {dst}")
-
-                elif use_symlink:
-                    try:
-                        if platform.system() == "Windows":
-                            os.symlink(src, dst, target_is_directory=os.path.isdir(src))
-                        else:
-                            os.symlink(src, dst)
-
-                        if meta['debug']:
-                            console.print(f"[green]Symbolic link created: {dst} -> {src}")
-
-                    except OSError as e:
-                        error_msg = f"Failed to create symlink: {e}"
-                        console.print(f"[bold red]{error_msg}")
-                        if allow_fallback:
-                            console.print(f"[yellow]Using original path without linking: {src}")
-                            use_symlink = False
-
-        # Initialize qBittorrent client
-        qbt_client = qbittorrentapi.Client(
-            host=client['qbit_url'],
-            port=client['qbit_port'],
-            username=client['qbit_user'],
-            password=client['qbit_pass'],
-            VERIFY_WEBUI_CERTIFICATE=client.get('VERIFY_WEBUI_CERTIFICATE', True)
-        )
-
-        if meta['debug']:
-            console.print("[bold yellow]Adding and rechecking torrent")
-
-        try:
-            qbt_client.auth_log_in()
-        except qbittorrentapi.LoginFailed:
-            console.print("[bold red]INCORRECT QBIT LOGIN CREDENTIALS")
-            return
-
-        # Apply remote pathing to `tracker_dir` before assigning `save_path`
-        if use_symlink or use_hardlink:
-            save_path = tracker_dir  # Default to linked directory
-        else:
-            save_path = path  # Default to the original path
-
-        # Handle remote path mapping
-        if local_path and remote_path and local_path.lower() != remote_path.lower():
-            # Normalize paths for comparison
-            norm_save_path = os.path.normpath(save_path).lower()
-            norm_local_path = os.path.normpath(local_path).lower()
-
-            # Check if the save_path starts with local_path
-            if norm_save_path.startswith(norm_local_path):
-                # Get the relative part of the path
-                rel_path = os.path.relpath(save_path, local_path)
-                # Combine remote path with relative path
-                save_path = os.path.join(remote_path, rel_path)
-
-            # For direct replacement if the above approach doesn't work
-            elif local_path.lower() in save_path.lower():
-                save_path = save_path.replace(local_path, remote_path, 1)  # Replace only at the beginning
-
-        # Always normalize separators for qBittorrent (it expects forward slashes)
-        save_path = save_path.replace(os.sep, '/')
-
-        # Ensure qBittorrent save path is formatted correctly
-        if not save_path.endswith('/'):
-            save_path += '/'
-
-        if meta['debug']:
-            console.print(f"[cyan]Original path: {path}")
-            console.print(f"[cyan]Mapped save path: {save_path}")
-
-        # Automatic management
-        auto_management = False
-        if not use_symlink and not use_hardlink:
-            am_config = client.get('automatic_management_paths', '')
-            if meta['debug']:
-                console.print(f"AM Config: {am_config}")
-            if isinstance(am_config, list):
-                for each in am_config:
-                    if os.path.normpath(each).lower() in os.path.normpath(path).lower():
-                        auto_management = True
-            else:
-                if os.path.normpath(am_config).lower() in os.path.normpath(path).lower() and am_config.strip() != "":
-                    auto_management = True
-
-        qbt_category = client.get("qbit_cat") if not meta.get("qbit_cat") else meta.get('qbit_cat')
-        content_layout = client.get('content_layout', 'Original')
-        if meta['debug']:
-            console.print("qbt_category:", qbt_category)
-            console.print(f"Content Layout: {content_layout}")
-            console.print(f"[bold yellow]qBittorrent save path: {save_path}")
-
-        try:
-            qbt_client.torrents_add(
-                torrent_files=torrent.dump(),
-                save_path=save_path,
-                use_auto_torrent_management=auto_management,
-                is_skip_checking=True,
-                content_layout=content_layout,
-                category=qbt_category
-            )
-        except qbittorrentapi.APIConnectionError as e:
-            console.print(f"[red]Failed to add torrent: {e}")
-            return
-
-        # Wait for torrent to be added
-        timeout = 30
-        for _ in range(timeout):
-            if len(qbt_client.torrents_info(torrent_hashes=torrent.infohash)) > 0:
-                break
-            await asyncio.sleep(1)
-        else:
-            console.print("[red]Torrent addition timed out.")
-            return
-
-        # Resume and tag torrent
-        qbt_client.torrents_resume(torrent.infohash)
-        if client.get("use_tracker_as_tag", False) and tracker:
-            qbt_client.torrents_add_tags(tags=tracker, torrent_hashes=torrent.infohash)
-        if client.get('qbit_tag'):
-            qbt_client.torrents_add_tags(tags=client['qbit_tag'], torrent_hashes=torrent.infohash)
-        if meta and meta.get('qbit_tag'):
-            qbt_client.torrents_add_tags(tags=meta['qbit_tag'], torrent_hashes=torrent.infohash)
-
-        if meta['debug']:
-            info = qbt_client.torrents_info(torrent_hashes=torrent.infohash)
-            console.print(f"[cyan]Actual qBittorrent save path: {info[0].save_path}")
-
-        if meta['debug']:
-            console.print(f"Added to: {save_path}")
-
-    def deluge(self, path, torrent_path, torrent, local_path, remote_path, client, meta):
-        client = DelugeRPCClient(client['deluge_url'], int(client['deluge_port']), client['deluge_user'], client['deluge_pass'])
-        # client = LocalDelugeRPCClient()
-        client.connect()
-        if client.connected is True:
-            console.print("Connected to Deluge")
-            isdir = os.path.isdir(path)  # noqa F841
-            # Remote path mount
-            if local_path.lower() in path.lower() and local_path.lower() != remote_path.lower():
-                path = path.replace(local_path, remote_path)
-                path = path.replace(os.sep, '/')
-
-            path = os.path.dirname(path)
-
-            client.call('core.add_torrent_file', torrent_path, base64.b64encode(torrent.dump()), {'download_location': path, 'seed_mode': True})
-            if meta['debug']:
-                console.print(f"[cyan]Path: {path}")
-        else:
-            console.print("[bold red]Unable to connect to deluge")
-
-    def transmission(self, path, torrent, local_path, remote_path, client, meta):
-        try:
-            tr_client = transmission_rpc.Client(
-                protocol=client['transmission_protocol'],
-                host=client['transmission_host'],
-                port=int(client['transmission_port']),
-                username=client['transmission_username'],
-                password=client['transmission_password'],
-                path=client.get('transmission_path', "/transmission/rpc")
-            )
-        except Exception:
-            console.print("[bold red]Unable to connect to transmission")
-            return
-
-        console.print("Connected to Transmission")
-        # Remote path mount
-        if local_path.lower() in path.lower() and local_path.lower() != remote_path.lower():
-            path = path.replace(local_path, remote_path)
-            path = path.replace(os.sep, '/')
-
-        path = os.path.dirname(path)
-
-        if meta.get('transmission_label') is not None:
-            label = [meta['transmission_label']]
-        elif client.get('transmission_label', None) is not None:
-            label = [client['transmission_label']]
-        else:
-            label = None
-
-        tr_client.add_torrent(
-            torrent=torrent.dump(),
-            download_dir=path,
-            labels=label
-        )
-
-        if meta['debug']:
-            console.print(f"[cyan]Path: {path}")
-
-    def add_fast_resume(self, metainfo, datapath, torrent):
-        """ Add fast resume data to a metafile dict.
-        """
-        # Get list of files
-        files = metainfo["info"].get("files", None)
-        single = files is None
-        if single:
-            if os.path.isdir(datapath):
-                datapath = os.path.join(datapath, metainfo["info"]["name"])
-            files = [{
-                "path": [os.path.abspath(datapath)],
-                "length": metainfo["info"]["length"],
-            }]
-
-        # Prepare resume data
-        resume = metainfo.setdefault("libtorrent_resume", {})
-        resume["bitfield"] = len(metainfo["info"]["pieces"]) // 20
-        resume["files"] = []
-        piece_length = metainfo["info"]["piece length"]
-        offset = 0
-
-        for fileinfo in files:
-            # Get the path into the filesystem
-            filepath = os.sep.join(fileinfo["path"])
-            if not single:
-                filepath = os.path.join(datapath, filepath.strip(os.sep))
-
-            # Check file size
-            if os.path.getsize(filepath) != fileinfo["length"]:
-                raise OSError(errno.EINVAL, "File size mismatch for %r [is %d, expected %d]" % (
-                    filepath, os.path.getsize(filepath), fileinfo["length"],
-                ))
-
-            # Add resume data for this file
-            resume["files"].append(dict(
-                priority=1,
-                mtime=int(os.path.getmtime(filepath)),
-                completed=(
-                    (offset + fileinfo["length"] + piece_length - 1) // piece_length -
-                    offset // piece_length
-                ),
-            ))
-            offset += fileinfo["length"]
-
-        return metainfo
-
-    async def remote_path_map(self, meta):
-        if meta.get('client', None) is None:
-            torrent_client = self.config['DEFAULT']['default_torrent_client']
-        else:
-            torrent_client = meta['client']
-        local_paths = self.config['TORRENT_CLIENTS'][torrent_client].get('local_path', ['/LocalPath'])
-        remote_paths = self.config['TORRENT_CLIENTS'][torrent_client].get('remote_path', ['/RemotePath'])
-
-        if not isinstance(local_paths, list):
-            local_paths = [local_paths]
-        if not isinstance(remote_paths, list):
-            remote_paths = [remote_paths]
+            raise ValueError("torrent_client_name must be a client name or client config dict")
+
+        def _coerce_paths(value: Any) -> list[str]:
+            if isinstance(value, list):
+                value_list = cast(list[Any], value)
+                return [str(v) for v in value_list if str(v)]
+            return [str(value)] if value is not None else []
+
+        local_paths = _coerce_paths(client_config.get('local_path', ['/LocalPath']))
+        remote_paths = _coerce_paths(client_config.get('remote_path', ['/RemotePath']))
+        if not local_paths:
+            local_paths = ['/LocalPath']
+        if not remote_paths:
+            remote_paths = ['/RemotePath']
 
         list_local_path = local_paths[0]
         list_remote_path = remote_paths[0]
+        meta_path = str(meta.get('path', ''))
 
-        for i in range(len(local_paths)):
-            if os.path.normpath(local_paths[i]).lower() in meta['path'].lower():
-                list_local_path = local_paths[i]
-                list_remote_path = remote_paths[i]
+        for i, local_path_value in enumerate(local_paths):
+            if os.path.normpath(local_path_value).lower() in meta_path.lower():
+                list_local_path = local_path_value
+                list_remote_path = remote_paths[i] if i < len(remote_paths) else remote_paths[0]
                 break
 
         local_path = os.path.normpath(list_local_path)
@@ -1196,7 +682,7 @@ class Clients():
 
         return local_path, remote_path
 
-    async def get_ptp_from_hash(self, meta, pathed=False):
+    async def get_ptp_from_hash(self, meta: dict[str, Any], pathed: bool = False) -> dict[str, Any]:
         default_torrent_client = self.config['DEFAULT']['default_torrent_client']
         client = self.config['TORRENT_CLIENTS'][default_torrent_client]
         torrent_client = client['torrent_client']
@@ -1204,689 +690,6 @@ class Clients():
             await self.get_ptp_from_hash_rtorrent(meta, pathed)
             return meta
         elif torrent_client == 'qbit':
-            qbt_client = qbittorrentapi.Client(
-                host=client['qbit_url'],
-                port=client['qbit_port'],
-                username=client['qbit_user'],
-                password=client['qbit_pass'],
-                VERIFY_WEBUI_CERTIFICATE=client.get('VERIFY_WEBUI_CERTIFICATE', True),
-                REQUESTS_ARGS={'timeout': 10}
-            )
-
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(qbt_client.auth_log_in),
-                    timeout=10.0
-                )
-            except asyncio.TimeoutError:
-                console.print("[bold red]Login attempt to qBittorrent timed out after 10 seconds")
-                return None
-            except qbittorrentapi.LoginFailed as e:
-                console.print(f"[bold red]Login failed while trying to get info hash: {e}")
-                exit(1)
-
-            info_hash_v1 = meta.get('infohash')
-            if meta['debug']:
-                console.print(f"[cyan]Searching for infohash: {info_hash_v1}")
-            torrents = qbt_client.torrents_info()
-            found = False
-
-            folder_id = os.path.basename(meta['path'])
-            if meta.get('uuid', None) is None:
-                meta['uuid'] = folder_id
-
-            extracted_torrent_dir = os.path.join(meta.get('base_dir', ''), "tmp", meta.get('uuid', ''))
-            os.makedirs(extracted_torrent_dir, exist_ok=True)
-
-            for torrent in torrents:
-                if torrent.get('infohash_v1') == info_hash_v1:
-                    comment = torrent.get('comment', "")
-                    match = None
-
-                    if 'torrent_comments' not in meta:
-                        meta['torrent_comments'] = []
-
-                    comment_data = {
-                        'hash': torrent.get('infohash_v1', ''),
-                        'name': torrent.get('name', ''),
-                        'comment': comment,
-                    }
-                    meta['torrent_comments'].append(comment_data)
-
-                    if meta.get('debug', False):
-                        console.print(f"[cyan]Stored comment for torrent: {comment[:100]}...")
-
-                    if "passthepopcorn.me" in comment:
-                        match = re.search(r'torrentid=(\d+)', comment)
-                        if match:
-                            meta['ptp'] = match.group(1)
-                    elif "https://aither.cc" in comment:
-                        match = re.search(r'/(\d+)$', comment)
-                        if match:
-                            meta['aither'] = match.group(1)
-                    elif "https://lst.gg" in comment:
-                        match = re.search(r'/(\d+)$', comment)
-                        if match:
-                            meta['lst'] = match.group(1)
-                    elif "https://onlyencodes.cc" in comment:
-                        match = re.search(r'/(\d+)$', comment)
-                        if match:
-                            meta['oe'] = match.group(1)
-                    elif "https://blutopia.cc" in comment:
-                        match = re.search(r'/(\d+)$', comment)
-                        if match:
-                            meta['blu'] = match.group(1)
-                    elif "https://upload.cx" in comment:
-                        match = re.search(r'/(\d+)$', comment)
-                        if match:
-                            meta['ulcx'] = match.group(1)
-                    elif "https://hdbits.org" in comment:
-                        match = re.search(r'id=(\d+)', comment)
-                        if match:
-                            meta['hdb'] = match.group(1)
-                    elif "https://broadcasthe.net" in comment:
-                        match = re.search(r'id=(\d+)', comment)
-                        if match:
-                            meta['btn'] = match.group(1)
-                    elif "https://beyond-hd.me" in comment:
-                        match = re.search(r'details/(\d+)', comment)
-                        if match:
-                            meta['bhd'] = match.group(1)
-                    elif "/torrents/" in comment:
-                        match = re.search(r'/(\d+)$', comment)
-                        if match:
-                            meta['huno'] = match.group(1)
-
-                    if match:
-                        for tracker in ['ptp', 'bhd', 'btn', 'huno', 'blu', 'aither', 'ulcx', 'lst', 'oe', 'hdb']:
-                            if meta.get(tracker):
-                                console.print(f"[bold cyan]meta updated with {tracker.upper()} ID: {meta[tracker]}")
-
-                    if meta.get('torrent_comments') and meta['debug']:
-                        console.print(f"[green]Stored {len(meta['torrent_comments'])} torrent comments for later use")
-
-                    if not pathed:
-                        torrent_storage_dir = client.get('torrent_storage_dir')
-                        if not torrent_storage_dir:
-                            # Export .torrent file
-                            torrent_hash = torrent.get('infohash_v1')
-                            if meta.get('debug', False):
-                                console.print(f"[cyan]Exporting .torrent file for hash: {torrent_hash}")
-
-                            try:
-                                torrent_file_content = qbt_client.torrents_export(torrent_hash=torrent_hash)
-                                torrent_file_path = os.path.join(extracted_torrent_dir, f"{torrent_hash}.torrent")
-
-                                with open(torrent_file_path, "wb") as f:
-                                    f.write(torrent_file_content)
-
-                                # Validate the .torrent file before saving as BASE.torrent
-                                valid, torrent_path = await self.is_valid_torrent(meta, torrent_file_path, torrent_hash, 'qbit', client, print_err=False)
-                                if not valid:
-                                    if meta['debug']:
-                                        console.print(f"[bold red]Validation failed for {torrent_file_path}")
-                                    os.remove(torrent_file_path)  # Remove invalid file
-                                else:
-                                    from src.torrentcreate import create_base_from_existing_torrent
-                                    await create_base_from_existing_torrent(torrent_file_path, meta['base_dir'], meta['uuid'])
-
-                            except qbittorrentapi.APIError as e:
-                                console.print(f"[bold red]Failed to export .torrent for {torrent_hash}: {e}")
-
-                    found = True
-                    break
-
-            if not found:
-                console.print("[bold red]Matching site torrent with the specified infohash_v1 not found.")
-
-            return meta
+            return await self.get_ptp_from_hash_qbit(meta, client, pathed)
         else:
             return meta
-
-    async def get_ptp_from_hash_rtorrent(self, meta, pathed=False):
-        default_torrent_client = self.config['DEFAULT']['default_torrent_client']
-        client = self.config['TORRENT_CLIENTS'][default_torrent_client]
-        torrent_storage_dir = client.get('torrent_storage_dir')
-        info_hash_v1 = meta.get('infohash')
-
-        if not torrent_storage_dir or not info_hash_v1:
-            console.print("[yellow]Missing torrent storage directory or infohash")
-            return meta
-
-        # Normalize info hash format for rTorrent (uppercase)
-        info_hash_v1 = info_hash_v1.upper().strip()
-        torrent_path = os.path.join(torrent_storage_dir, f"{info_hash_v1}.torrent")
-
-        # Extract folder ID for use in temporary file path
-        folder_id = os.path.basename(meta['path'])
-        if meta.get('uuid', None) is None:
-            meta['uuid'] = folder_id
-
-        extracted_torrent_dir = os.path.join(meta.get('base_dir', ''), "tmp", meta.get('uuid', ''))
-        os.makedirs(extracted_torrent_dir, exist_ok=True)
-
-        # Check if the torrent file exists directly
-        if os.path.exists(torrent_path):
-            console.print(f"[green]Found matching torrent file: {torrent_path}")
-        else:
-            # Try to find the torrent file in storage directory (case insensitive)
-            found = False
-            console.print(f"[yellow]Searching for torrent file with hash {info_hash_v1} in {torrent_storage_dir}")
-
-            if os.path.exists(torrent_storage_dir):
-                for filename in os.listdir(torrent_storage_dir):
-                    if filename.lower().endswith(".torrent"):
-                        file_hash = os.path.splitext(filename)[0]  # Remove .torrent extension
-                        if file_hash.upper() == info_hash_v1:
-                            torrent_path = os.path.join(torrent_storage_dir, filename)
-                            found = True
-                            console.print(f"[green]Found torrent file with matching hash: {filename}")
-                            break
-
-            if not found:
-                console.print(f"[bold red]No torrent file found for hash: {info_hash_v1}")
-                return meta
-
-        # Parse the torrent file to get the comment
-        try:
-            torrent = Torrent.read(torrent_path)
-            comment = torrent.comment or ""
-
-            # Try to find tracker IDs in the comment
-            if meta.get('debug'):
-                console.print(f"[cyan]Torrent comment: {comment}")
-
-            if 'torrent_comments' not in meta:
-                meta['torrent_comments'] = []
-
-            comment_data = {
-                'hash': torrent.get('infohash_v1', ''),
-                'name': torrent.get('name', ''),
-                'comment': comment,
-            }
-            meta['torrent_comments'].append(comment_data)
-
-            if meta.get('debug', False):
-                console.print(f"[cyan]Stored comment for torrent: {comment[:100]}...")
-
-            # Handle various tracker URL formats in the comment
-            if "passthepopcorn.me" in comment:
-                match = re.search(r'torrentid=(\d+)', comment)
-                if match:
-                    meta['ptp'] = match.group(1)
-            elif "https://aither.cc" in comment:
-                match = re.search(r'/(\d+)$', comment)
-                if match:
-                    meta['aither'] = match.group(1)
-            elif "https://lst.gg" in comment:
-                match = re.search(r'/(\d+)$', comment)
-                if match:
-                    meta['lst'] = match.group(1)
-            elif "https://onlyencodes.cc" in comment:
-                match = re.search(r'/(\d+)$', comment)
-                if match:
-                    meta['oe'] = match.group(1)
-            elif "https://blutopia.cc" in comment:
-                match = re.search(r'/(\d+)$', comment)
-                if match:
-                    meta['blu'] = match.group(1)
-            elif "https://hdbits.org" in comment:
-                match = re.search(r'id=(\d+)', comment)
-                if match:
-                    meta['hdb'] = match.group(1)
-            elif "https://broadcasthe.net" in comment:
-                match = re.search(r'id=(\d+)', comment)
-                if match:
-                    meta['btn'] = match.group(1)
-            elif "https://beyond-hd.me" in comment:
-                match = re.search(r'details/(\d+)', comment)
-                if match:
-                    meta['bhd'] = match.group(1)
-
-            # If we found a tracker ID, log it
-            for tracker in ['ptp', 'bhd', 'btn', 'blu', 'aither', 'lst', 'oe', 'hdb']:
-                if meta.get(tracker):
-                    console.print(f"[bold cyan]meta updated with {tracker.upper()} ID: {meta[tracker]}")
-
-            if meta.get('torrent_comments') and meta['debug']:
-                console.print(f"[green]Stored {len(meta['torrent_comments'])} torrent comments for later use")
-
-            if not pathed:
-                valid, resolved_path = await self.is_valid_torrent(
-                    meta, torrent_path, info_hash_v1, 'rtorrent', client, print_err=False
-                )
-
-                if valid:
-                    base_torrent_path = os.path.join(extracted_torrent_dir, "BASE.torrent")
-
-                    try:
-                        from src.torrentcreate import create_base_from_existing_torrent
-                        await create_base_from_existing_torrent(resolved_path, meta['base_dir'], meta['uuid'])
-                        if meta['debug']:
-                            console.print("[green]Created BASE.torrent from existing torrent")
-                    except Exception as e:
-                        console.print(f"[bold red]Error creating BASE.torrent: {e}")
-                        try:
-                            shutil.copy2(resolved_path, base_torrent_path)
-                            console.print(f"[yellow]Created simple torrent copy as fallback: {base_torrent_path}")
-                        except Exception as copy_err:
-                            console.print(f"[bold red]Failed to create backup copy: {copy_err}")
-
-        except Exception as e:
-            console.print(f"[bold red]Error reading torrent file: {e}")
-            import traceback
-            console.print(f"[dim]{traceback.format_exc()}[/dim]")
-
-        return meta
-
-    async def get_pathed_torrents(self, path, meta):
-        try:
-            matching_torrents = await self.find_qbit_torrents_by_path(path, meta)
-
-            # If we found matches, use the hash from the first exact match
-            if matching_torrents:
-                exact_matches = [t for t in matching_torrents]
-                if exact_matches:
-                    meta['infohash'] = exact_matches[0]['hash']
-                    if meta['debug']:
-                        console.print(f"[green]Found exact torrent match with hash: {meta['infohash']}")
-
-            else:
-                if meta['debug']:
-                    console.print("[yellow]No matching torrents for the path found in qBittorrent[/yellow]")
-
-        except Exception as e:
-            console.print(f"[red]Error searching for torrents: {str(e)}[/red]")
-            import traceback
-            console.print(f"[dim]{traceback.format_exc()}[/dim]")
-
-    async def find_qbit_torrents_by_path(self, content_path, meta):
-        if meta.get('debug'):
-            console.print(f"[yellow]Searching for torrents in qBittorrent for path: {content_path}[/yellow]")
-        try:
-            if meta.get('client', None) is None:
-                default_torrent_client = self.config['DEFAULT']['default_torrent_client']
-            else:
-                default_torrent_client = meta['client']
-            if meta.get('client', None) == 'none':
-                return
-            if default_torrent_client == "none":
-                return
-            client_config = self.config['TORRENT_CLIENTS'][default_torrent_client]
-            torrent_client = client_config['torrent_client']
-
-            if torrent_client != 'qbit':
-                return []
-
-            tracker_patterns = {
-                'ptp': {"url": "passthepopcorn.me", "pattern": r'torrentid=(\d+)'},
-                'aither': {"url": "https://aither.cc", "pattern": r'/(\d+)$'},
-                'lst': {"url": "https://lst.gg", "pattern": r'/(\d+)$'},
-                'oe': {"url": "https://onlyencodes.cc", "pattern": r'/(\d+)$'},
-                'blu': {"url": "https://blutopia.cc", "pattern": r'/(\d+)$'},
-                'hdb': {"url": "https://hdbits.org", "pattern": r'id=(\d+)'},
-                'btn': {"url": "https://broadcasthe.net", "pattern": r'id=(\d+)'},
-                'bhd': {"url": "https://beyond-hd.me", "pattern": r'details/(\d+)'},
-                'huno': {"url": "https://hawke.uno", "pattern": r'/(\d+)$'},
-                'ulcx': {"url": "https://upload.cx", "pattern": r'/(\d+)$'},
-                'rf': {"url": "https://reelflix.xyz", "pattern": r'/(\d+)$'},
-                'otw': {"url": "https://oldtoons.world", "pattern": r'/(\d+)$'},
-                'yus': {"url": "https://yu-scene.net", "pattern": r'/(\d+)$'},
-                'dp': {"url": "https://darkpeers.org", "pattern": r'/(\d+)$'},
-                'sp': {"url": "https://seedpool.org", "pattern": r'/(\d+)$'},
-            }
-
-            tracker_priority = ['aither', 'ulcx', 'lst', 'blu', 'oe', 'btn', 'bhd', 'huno', 'hdb', 'rf', 'otw', 'yus', 'dp', 'sp', 'ptp']
-
-            try:
-                qbt_client = qbittorrentapi.Client(
-                    host=client_config['qbit_url'],
-                    port=int(client_config['qbit_port']),
-                    username=client_config['qbit_user'],
-                    password=client_config['qbit_pass'],
-                    VERIFY_WEBUI_CERTIFICATE=client_config.get('VERIFY_WEBUI_CERTIFICATE', True),
-                    REQUESTS_ARGS={'timeout': 10}
-                )
-
-                try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(qbt_client.auth_log_in),
-                        timeout=10.0
-                    )
-                except asyncio.TimeoutError:
-                    console.print("[bold red]Connection to qBittorrent timed out after 10 seconds")
-                    return []
-
-            except qbittorrentapi.LoginFailed:
-                console.print("[bold red]Failed to login to qBittorrent - incorrect credentials")
-                return []
-
-            except qbittorrentapi.APIConnectionError:
-                console.print("[bold red]Failed to connect to qBittorrent - check host/port")
-                return []
-
-            torrents = await asyncio.to_thread(qbt_client.torrents_info)
-            if meta['debug']:
-                console.print(f"[cyan]Found {len(torrents)} torrents in qBittorrent")
-
-            matching_torrents = []
-
-            # First collect exact path matches
-            for torrent in torrents:
-                try:
-                    torrent_name = torrent.name
-                    if not torrent_name:
-                        if meta['debug']:
-                            console.print("[yellow]Skipping torrent with missing name attribute")
-                        continue
-
-                    is_match = False
-
-                    # Match logic for single files vs disc/multi-file
-                    # Add a fallback default value for meta['is_disc']
-                    is_disc = meta.get('is_disc', "")
-
-                    if is_disc in ("", None) and len(meta.get('filelist', [])) == 1:
-                        file_name = os.path.basename(meta['filelist'][0])
-                        if (torrent_name == file_name) and len(torrent.files) == 1:
-                            is_match = True
-                        elif torrent_name == meta['uuid']:
-                            is_match = True
-                    else:
-                        if torrent_name == meta['uuid']:
-                            is_match = True
-
-                    if not is_match:
-                        continue
-
-                    has_working_tracker = False
-
-                    if is_match:
-                        try:
-                            torrent_trackers = await asyncio.to_thread(qbt_client.torrents_trackers, torrent_hash=torrent.hash)
-                            display_trackers = []
-
-                            # Filter out DHT, PEX, LSD "trackers"
-                            for tracker in torrent_trackers:
-                                if tracker.get('url', []).startswith(('** [DHT]', '** [PeX]', '** [LSD]')):
-                                    continue
-                                display_trackers.append(tracker)
-
-                                for tracker in display_trackers:
-                                    url = tracker.get('url', 'Unknown URL')
-                                    status_code = tracker.get('status', 0)
-                                    status_text = {
-                                        0: "Disabled",
-                                        1: "Not contacted",
-                                        2: "Working",
-                                        3: "Updating",
-                                        4: "Error"
-                                    }.get(status_code, f"Unknown ({status_code})")
-
-                                    if status_code == 2:
-                                        has_working_tracker = True
-                                        if meta['debug']:
-                                            console.print(f"[green]Tracker working: {url[:15]} - {status_text}")
-
-                                    elif meta['debug']:
-                                        msg = tracker.get('msg', '')
-                                        console.print(f"[yellow]Tracker not working: {url[:15]} - {status_text}{f' - {msg}' if msg else ''}")
-
-                        except qbittorrentapi.APIError as e:
-                            if meta['debug']:
-                                console.print(f"[red]Error fetching trackers for torrent {torrent.name}: {e}")
-                            continue
-
-                        if 'torrent_comments' not in meta:
-                            meta['torrent_comments'] = []
-
-                        match_info = {
-                            'hash': torrent.hash,
-                            'name': torrent.name,
-                            'save_path': torrent.save_path,
-                            'content_path': os.path.normpath(os.path.join(torrent.save_path, torrent.name)),
-                            'size': torrent.size,
-                            'category': torrent.category,
-                            'seeders': torrent.num_complete,
-                            'trackers': url,
-                            'has_working_tracker': has_working_tracker,
-                            'comment': torrent.comment,
-                        }
-
-                        # Initialize a list for found tracker IDs
-                        tracker_found = False
-                        tracker_urls = []
-
-                        for tracker_id in tracker_priority:
-                            tracker_info = tracker_patterns.get(tracker_id)
-                            if not tracker_info:
-                                continue
-
-                            if tracker_info["url"] in torrent.comment:
-                                match = re.search(tracker_info["pattern"], torrent.comment)
-                                if match:
-                                    tracker_id_value = match.group(1)
-                                    tracker_urls.append({
-                                        'id': tracker_id,
-                                        'tracker_id': tracker_id_value
-                                    })
-                                    meta[tracker_id] = tracker_id_value
-                                    tracker_found = True
-
-                        if torrent.tracker and 'hawke.uno' in torrent.tracker:
-                            # Try to extract torrent ID from the comment first
-                            if not has_working_tracker:
-                                huno_id = None
-                                if "/torrents/" in torrent.comment:
-                                    match = re.search(r'/torrents/(\d+)', torrent.comment)
-                                    if match:
-                                        huno_id = match.group(1)
-
-                                # If we found an ID, use it
-                                if huno_id:
-                                    tracker_urls.append({
-                                        'id': 'huno',
-                                        'tracker_id': huno_id,
-                                    })
-                                    meta['huno'] = huno_id
-                                    tracker_found = True
-
-                        if torrent.tracker and 'tracker.anthelion.me' in torrent.tracker:
-                            ant_id = 1
-                            if has_working_tracker:
-                                tracker_urls.append({
-                                    'id': 'ant',
-                                    'tracker_id': ant_id,
-                                })
-                                meta['ant'] = ant_id
-                                tracker_found = True
-
-                        match_info['tracker_urls'] = tracker_urls
-                        match_info['has_tracker'] = tracker_found
-
-                        if tracker_found:
-                            meta['found_tracker_match'] = True
-
-                        if meta.get('debug', False):
-                            console.print(f"[cyan]Stored comment for torrent: {torrent.comment[:100]}...")
-
-                        meta['torrent_comments'].append(match_info)
-                        matching_torrents.append(match_info)
-
-                except Exception as e:
-                    if meta['debug']:
-                        console.print(f"[yellow]Error processing torrent {torrent.name}: {str(e)}")
-                    continue
-
-            if matching_torrents:
-                def get_priority_score(torrent):
-                    # Start with a high score for torrents with no matching trackers
-                    priority_score = 100
-
-                    # If torrent has tracker URLs, find the highest priority one
-                    if torrent.get('tracker_urls'):
-                        for tracker_url in torrent['tracker_urls']:
-                            tracker_id = tracker_url.get('id')
-                            if tracker_id in tracker_priority:
-                                # Lower index in priority list = higher priority
-                                score = tracker_priority.index(tracker_id)
-                                priority_score = min(priority_score, score)
-
-                    # Return tuple for sorting: (has_working_tracker, tracker_priority, has_tracker)
-                    return (
-                        not torrent['has_working_tracker'],
-                        priority_score,
-                        not torrent['has_tracker']
-                    )
-
-                # Sort matches by the priority score function
-                matching_torrents.sort(key=get_priority_score)
-
-                if matching_torrents:
-                    # Extract tracker IDs to meta for the best match (first one after sorting)
-                    best_match = matching_torrents[0]
-                    meta['infohash'] = best_match['hash']
-                    found_valid_torrent = False
-
-                    # Always extract tracker IDs from the best match
-                    if best_match['has_tracker']:
-                        for tracker in best_match['tracker_urls']:
-                            if tracker.get('id') and tracker.get('tracker_id'):
-                                meta[tracker['id']] = tracker['tracker_id']
-                                if meta['debug']:
-                                    console.print(f"[bold cyan]Found {tracker['id'].upper()} ID: {tracker['tracker_id']} in torrent comment")
-
-                    if not meta.get('base_torrent_created'):
-                        default_torrent_client = self.config['DEFAULT']['default_torrent_client']
-                        client = self.config['TORRENT_CLIENTS'][default_torrent_client]
-                        torrent_client = client['torrent_client']
-                        torrent_storage_dir = client.get('torrent_storage_dir')
-
-                        extracted_torrent_dir = os.path.join(meta.get('base_dir', ''), "tmp", meta.get('uuid', ''))
-                        os.makedirs(extracted_torrent_dir, exist_ok=True)
-
-                        # Try the best match first
-                        torrent_hash = best_match['hash']
-                        torrent_file_path = None
-
-                        if torrent_storage_dir:
-                            potential_path = os.path.join(torrent_storage_dir, f"{torrent_hash}.torrent")
-                            if os.path.exists(potential_path):
-                                torrent_file_path = potential_path
-                                if meta.get('debug', False):
-                                    console.print(f"[cyan]Found existing .torrent file: {torrent_file_path}")
-
-                        if not torrent_file_path:
-                            if meta.get('debug', False):
-                                console.print(f"[cyan]Exporting .torrent file for hash: {torrent_hash}")
-
-                            try:
-                                torrent_file_content = qbt_client.torrents_export(torrent_hash=torrent_hash)
-                                torrent_file_path = os.path.join(extracted_torrent_dir, f"{torrent_hash}.torrent")
-
-                                with open(torrent_file_path, "wb") as f:
-                                    f.write(torrent_file_content)
-
-                                if meta.get('debug', False):
-                                    console.print(f"[green]Exported .torrent file to: {torrent_file_path}")
-
-                            except qbittorrentapi.APIError as e:
-                                console.print(f"[bold red]Failed to export .torrent for {torrent_hash}: {e}")
-
-                        if torrent_file_path:
-                            valid, torrent_path = await self.is_valid_torrent(meta, torrent_file_path, torrent_hash, 'qbit', client, print_err=False)
-                            if valid:
-                                try:
-                                    from src.torrentcreate import create_base_from_existing_torrent
-                                    await create_base_from_existing_torrent(torrent_file_path, meta['base_dir'], meta['uuid'])
-                                    if meta['debug']:
-                                        console.print("[green]Created BASE.torrent from existing torrent")
-                                    meta['base_torrent_created'] = True
-                                    found_valid_torrent = True
-                                except Exception as e:
-                                    console.print(f"[bold red]Error creating BASE.torrent: {e}")
-                            else:
-                                if meta['debug']:
-                                    console.print(f"[bold red]Validation failed for best match torrent {torrent_file_path}")
-                                if os.path.exists(torrent_file_path) and torrent_file_path.startswith(extracted_torrent_dir):
-                                    os.remove(torrent_file_path)
-
-                                # Try other matches if the best match isn't valid
-                                if meta['debug']:
-                                    console.print("[yellow]Trying other torrent matches...")
-                                for torrent_match in matching_torrents[1:]:  # Skip the first one since we already tried it
-                                    alt_torrent_hash = torrent_match['hash']
-                                    alt_torrent_file_path = None
-
-                                    if meta.get('debug', False):
-                                        console.print(f"[cyan]Trying alternative torrent: {alt_torrent_hash}")
-
-                                    # Check if alternative torrent file exists in storage directory
-                                    if torrent_storage_dir:
-                                        alt_potential_path = os.path.join(torrent_storage_dir, f"{alt_torrent_hash}.torrent")
-                                        if os.path.exists(alt_potential_path):
-                                            alt_torrent_file_path = alt_potential_path
-                                            if meta.get('debug', False):
-                                                console.print(f"[cyan]Found existing alternative .torrent file: {alt_torrent_file_path}")
-
-                                    # If not found in storage directory, export from qBittorrent
-                                    if not alt_torrent_file_path:
-                                        try:
-                                            alt_torrent_file_content = qbt_client.torrents_export(torrent_hash=alt_torrent_hash)
-                                            alt_torrent_file_path = os.path.join(extracted_torrent_dir, f"{alt_torrent_hash}.torrent")
-
-                                            with open(alt_torrent_file_path, "wb") as f:
-                                                f.write(alt_torrent_file_content)
-
-                                            if meta.get('debug', False):
-                                                console.print(f"[green]Exported alternative .torrent file to: {alt_torrent_file_path}")
-
-                                        except qbittorrentapi.APIError as e:
-                                            console.print(f"[bold red]Failed to export alternative .torrent for {alt_torrent_hash}: {e}")
-                                            continue
-
-                                    # Validate the alternative torrent
-                                    if alt_torrent_file_path:
-                                        alt_valid, alt_torrent_path = await self.is_valid_torrent(
-                                            meta, alt_torrent_file_path, alt_torrent_hash, 'qbit', client, print_err=False
-                                        )
-
-                                        if alt_valid:
-                                            try:
-                                                from src.torrentcreate import create_base_from_existing_torrent
-                                                await create_base_from_existing_torrent(alt_torrent_file_path, meta['base_dir'], meta['uuid'])
-                                                if meta['debug']:
-                                                    console.print(f"[green]Created BASE.torrent from alternative torrent {alt_torrent_hash}")
-                                                meta['infohash'] = alt_torrent_hash  # Update infohash to use the valid torrent
-                                                meta['base_torrent_created'] = True
-                                                found_valid_torrent = True
-                                                break
-                                            except Exception as e:
-                                                console.print(f"[bold red]Error creating BASE.torrent for alternative: {e}")
-                                        else:
-                                            if meta['debug']:
-                                                console.print(f"[yellow]Alternative torrent {alt_torrent_hash} also invalid")
-                                            if os.path.exists(alt_torrent_file_path) and alt_torrent_file_path.startswith(extracted_torrent_dir):
-                                                os.remove(alt_torrent_file_path)
-
-                                if not found_valid_torrent:
-                                    if meta['debug']:
-                                        console.print("[bold red]No valid torrents found after checking all matches")
-                                    meta['we_checked_them_all'] = True
-
-            # Display results summary
-            if meta['debug']:
-                if matching_torrents:
-                    console.print(f"[green]Found {len(matching_torrents)} matching torrents")
-                    console.print(f"[green]Torrents with working trackers: {sum(1 for t in matching_torrents if t.get('has_working_tracker', False))}")
-                else:
-                    console.print(f"[yellow]No matching torrents found for {torrent_name}")
-
-            return matching_torrents
-
-        except Exception as e:
-            console.print(f"[bold red]Error finding torrents: {str(e)}")
-            if meta['debug']:
-                import traceback
-                console.print(traceback.format_exc())
-            return []
