@@ -21,6 +21,15 @@ class RHD(UNIT3D):
     MARKER_PATTERN = re.compile(r"\b(UNTOUCHED|VU1080|VU720|VU)\b", re.IGNORECASE)
 
     def __init__(self, config: Config) -> None:
+        """
+        Initialize the RHD tracker client with site-specific configuration, endpoints, and defaults.
+        
+        Parameters:
+            config (Config): Configuration object used to initialize tracker settings (URLs, credentials, and other site-specific options).
+        
+        Description:
+            Stores the provided config, creates a COMMON helper, sets the tracker identifier to "RHD", initializes base and API endpoint URLs used by the tracker, and defines a default list of banned release groups.
+        """
         super().__init__(config, tracker_name='RHD')
         self.config = config
         self.common = COMMON(config)
@@ -46,6 +55,15 @@ class RHD(UNIT3D):
         reverse: bool = False,
         mapping_only: bool = False,
     ) -> dict[str, str]:
+        """
+        Map the media resolution in `meta` to RocketHD's internal `resolution_id`.
+        
+        Parameters:
+            meta (Meta): Metadata mapping that must contain a `resolution` key whose value is matched against known resolution strings.
+        
+        Returns:
+            dict[str, str]: A dictionary with key `resolution_id` containing the tracker-specific resolution identifier as a string. If the resolution is unrecognized, `'10'` is returned.
+        """
         _ = (resolution, reverse, mapping_only)
         resolution_id = {
             '8640p': '10',
@@ -71,7 +89,23 @@ class RHD(UNIT3D):
         return os.path.basename(path)
 
     def _get_language_code(self, track_or_string: Any) -> str:
-        """Extract and normalize language to ISO alpha-2 code"""
+        """
+        Normalize a language value to an ISO 639-1 (alpha-2) code.
+        
+        Accepts either a mediainfo track dictionary or a language string, extracts the language,
+        and normalizes it to a lowercase two-letter ISO 639-1 code when possible. Region subtags
+        are removed (e.g., "en-US" → "en"). If resolution via pycountry succeeds the
+        alpha-2 code is returned; otherwise the normalized input string is returned. An empty
+        input yields an empty string.
+        
+        Parameters:
+            track_or_string (Any): A mediainfo track dict (with "Language" or nested {"Language": {"String": ...}})
+                or a plain language string (e.g., "English", "en", "eng", "en-US").
+        
+        Returns:
+            str: Lowercase ISO 639-1 alpha-2 code if resolvable, otherwise the normalized input string,
+            or an empty string if no language was provided.
+        """
         if isinstance(track_or_string, dict):
             track_dict = cast(dict[str, Any], track_or_string)
             lang = track_dict.get("Language", "")
@@ -100,7 +134,16 @@ class RHD(UNIT3D):
             return lang_str
 
     def _get_german_title(self, imdb_info: dict[str, Any]) -> Optional[str]:
-        """Extract German title from IMDb AKAs with priority"""
+        """
+        Selects a German title from an IMDb AKAs list, preferring an AKA with country "Germany" and no attributes.
+        
+        Parameters:
+            imdb_info (dict[str, Any]): IMDb information containing an "akas" entry which should be a list of dicts.
+                Each AKA dict may include keys "title" (str), "country" (str), "language" (str), and "attributes".
+        
+        Returns:
+            Optional[str]: The German title found (country-prioritized), or `None` if no suitable German AKA exists.
+        """
         country_match: Optional[str] = None
         language_match: Optional[str] = None
 
@@ -120,7 +163,15 @@ class RHD(UNIT3D):
         return country_match or language_match
 
     def _has_german_audio(self, meta: dict[str, Any]) -> bool:
-        """Check for German audio tracks, excluding commentary"""
+        """
+        Determine whether the media contains at least one German audio track that is not labeled as commentary.
+        
+        Parameters:
+            meta (dict): Metadata dictionary expected to contain a 'mediainfo' structure with 'media' -> 'track' entries.
+        
+        Returns:
+            bool: `true` if at least one non-commentary audio track has language code 'de', `false` otherwise.
+        """
         if "mediainfo" not in meta:
             return False
 
@@ -133,7 +184,15 @@ class RHD(UNIT3D):
         )
 
     def _has_german_subtitles(self, meta: dict[str, Any]) -> bool:
-        """Check for German subtitle tracks"""
+        """
+        Determine whether the media contains German subtitle tracks.
+        
+        Parameters:
+        	meta (dict): Metadata dictionary expected to contain a MediaInfo-style structure under the "mediainfo" key.
+        
+        Returns:
+        	`true` if any subtitle track (`@type` == "Text") has language code "de", `false` otherwise. If "mediainfo" is missing, returns `false`.
+        """
         if "mediainfo" not in meta:
             return False
 
@@ -144,7 +203,15 @@ class RHD(UNIT3D):
         )
 
     def _get_language_name(self, iso_code: str) -> str:
-        """Convert ISO language code to full name (e.g. GERMAN, ENGLISH)"""
+        """
+        Resolve an ISO language code or language name to its full language name in uppercase.
+        
+        Parameters:
+            iso_code (str): An ISO language identifier (alpha-2 like "en", alpha-3 like "eng") or a language name (e.g., "English"). May be empty.
+        
+        Returns:
+            str: The resolved language name in uppercase (e.g., "ENGLISH"). Returns the input uppercased if resolution fails, or an empty string for empty input.
+        """
         if not iso_code:
             return ""
 
@@ -170,15 +237,12 @@ class RHD(UNIT3D):
 
     async def get_name(self, meta: dict[str, Any]) -> dict[str, str]:
         """
-        Rebuild release name from meta components following RocketHD naming rules.
-
-        Handles:
-        - REMUX detection from filename markers (VU/UNTOUCHED)
-        - German title substitution from IMDb AKAs
-        - audio-language tags (ENGLISH, GERMAN, GERMAN DL, MULTI, etc.)
-        - GERMAN SUBBED tag when no German audio present, but German subtitles are
-        - Release group tag cleaning and validation
-        - DISC region injection
+        Builds a RocketHD-style release name from the provided metadata.
+        
+        Constructs a normalized release title using meta fields (title, year, resolution, source, codecs, season/episode data, edition, HDR/UHD/3D flags, audio and subtitle information, repack/region markers, and other heuristics), applies optional German-title substitution, derives an audio-language tag (including multi-/dual-audio and "GERMAN SUBBED" cases), formats type-specific naming (DISC/REMUX/DVDRip/BRRip/ENCODE/HDTV/WEBDL/WEBRip), collapses extra whitespace, removes Dual-Audio markers, and appends a validated release group tag when available.
+        
+        Returns:
+            name (dict[str, str]): Mapping with key "name" containing the generated release name string.
         """
         if not meta.get("language_checked", False):
             await languages_manager.process_desc_language(meta, tracker=self.tracker)
@@ -335,7 +399,15 @@ class RHD(UNIT3D):
         return {"name": name}
 
     def _extract_clean_release_group(self, meta: dict[str, Any]) -> str:
-        """Extract release group - only accepts VU/UNTOUCHED markers from filename"""
+        """
+        Extract a clean release group tag from the provided metadata, accepting only VU/UNTOUCHED-like markers.
+        
+        Parameters:
+            meta (dict): Metadata for the release; may include 'tag', 'mediainfo', and filelist/path used to derive a filename.
+        
+        Returns:
+            str: The cleaned release group tag, or 'NOGRP' if no valid tag could be determined.
+        """
         raw_tag = meta.get("tag", "")
         tag = raw_tag.strip().lstrip("-") if isinstance(raw_tag, str) else ""
         if tag and " " not in tag and not self.INVALID_TAG_PATTERN.search(tag):
@@ -377,6 +449,22 @@ class RHD(UNIT3D):
         return potential_tag
 
     async def get_additional_checks(self, meta: Meta) -> bool:
+        """
+        Run site-specific pre-upload validation checks and prompt the user to confirm or abort when a rule is violated.
+        
+        Performs these checks:
+        - Prohibits uploads that appear to be MIC, CAM, TS, TELESYNC, LD/LINE, or marked as UPSCALE.
+        - Prohibits SD resolutions (384p, 480p/480i, 540p, 576p/576i) unless explicitly overridden.
+        - Requires a German audio track unless the release was requested in its original language.
+        - Prohibits uploads that include sample/proof/image files in the filelist.
+        
+        Parameters:
+            meta (Meta): Release metadata used for validation. Expected keys include `resolution`, `filelist`,
+                         `requested_release`, and data used by `_has_german_audio` and `get_basename`.
+        
+        Returns:
+            bool: `True` if the upload should proceed, `False` if the user declined to continue after a failing check.
+        """
         should_continue = True
 
         # Uploading MIC, CAM, TS, LD, as well as upscale releases, is prohibited.
