@@ -532,6 +532,13 @@ config = {
             "uploader_name": "https://filelist.io/Custom_Announce_URL",
             "anon": False,
         },
+        "FLD": {
+            # Instead of using the tracker acronym for folder name when sym/hard linking, you can use a custom name
+            "link_dir_name": "",
+            "api_key": "",
+            "anon": False,
+            "announce_url": "https://flood.st/announce/YOUR_ANNOUNCE_KEY",
+        },
         "FNP": {
             # Instead of using the tracker acronym for folder name when sym/hard linking, you can use a custom name
             "link_dir_name": "",
